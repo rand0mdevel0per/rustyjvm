@@ -1,0 +1,11 @@
+[package]
+name = "rjava-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rjava-core = { workspace = true }
+rjava-interp = { workspace = true }

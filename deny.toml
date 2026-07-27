@@ -1,0 +1,32 @@
+# cargo-deny configuration (RJVM-SPEC-001 §21: pin exact versions, flag typosquats).
+# NOTE: schema targets a recent cargo-deny; the CI `deny` job is advisory (continue-on-error)
+# until the toolchain version is fixed, then it becomes a hard gate.
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses acceptable for a MIT-licensed project.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Typosquat / supply-chain hygiene (§21). Tighten as the dep set stabilizes.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

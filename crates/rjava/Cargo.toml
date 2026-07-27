@@ -1,0 +1,30 @@
+[package]
+name = "rjava"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RustyJVM: a clean-room general-purpose JVM in Rust (java-compatible launcher + embeddable library)."
+
+[dependencies]
+rjava-core = { workspace = true }
+rjava-classfile = { workspace = true }
+rjava-verify = { workspace = true }
+rjava-ir = { workspace = true }
+rjava-gc = { workspace = true }
+rjava-loader = { workspace = true }
+rjava-interp = { workspace = true }
+rjava-std = { workspace = true }
+rjava-native = { workspace = true }
+rjava-jit = { workspace = true }
+rjava-aot = { workspace = true }
+
+# Acceleration-layer seams (RJVM-SPEC-001 P-1/§13.4): removable, attached via the
+# L2Op.accel CAS. Declared now as empty placeholders; backends wired in M2.
+[features]
+default = []
+jit-cranelift = []
+jit-llvm = []
+aot = []
+graphics = []

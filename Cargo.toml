@@ -1,0 +1,47 @@
+# RustyJVM — clean-room general-purpose JVM in Rust.
+# North star: observable-behavior conformance to Amazon Corretto 21 (RJVM-SPEC-001 §P-5).
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["The RustyJVM Authors"]
+repository = "https://github.com/rand0mdevel0per/rustyjvm"
+rust-version = "1.91"
+
+[workspace.dependencies]
+# --- internal crates (dependency DAG per RJVM-SPEC-001 §3.2) ---
+rjava-core = { path = "crates/rjava-core" }
+rjava-classfile = { path = "crates/rjava-classfile" }
+rjava-verify = { path = "crates/rjava-verify" }
+rjava-ir = { path = "crates/rjava-ir" }
+rjava-gc = { path = "crates/rjava-gc" }
+rjava-loader = { path = "crates/rjava-loader" }
+rjava-interp = { path = "crates/rjava-interp" }
+rjava-std = { path = "crates/rjava-std" }
+rjava-native = { path = "crates/rjava-native" }
+rjava-jit = { path = "crates/rjava-jit" }
+rjava-aot = { path = "crates/rjava-aot" }
+
+# --- external deps (exact versions pinned via Cargo.lock, committed) ---
+# On by default:
+portable-atomic = { version = "1", features = ["fallback"] } # §12.6 128-bit CASP/LDXP-STXP, Android v8.0 long tail
+rayon = "1"          # §10.2 worker dispatch for runnable diff chains
+dashmap = "6"        # §10.1 ClassRegistry / lookup tables
+smallvec = "1"       # §9.2 Node.ins SmallVec<[ValId; 3]>
+parking_lot = "0.12" # HOST-side locks only; never guest monitors
+thiserror = "2"      # HOST-internal errors only; guest errors map to JVMS types
+# Dev:
+proptest = "1"       # §23.3 verifier fuzzing + differential input generation
+
+# Release profile: strict FP is mandatory (§13.6); never enable fast-math.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0

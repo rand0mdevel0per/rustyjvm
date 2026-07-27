@@ -1,0 +1,6 @@
+[toolchain]
+# Rolling nightly (matches the dev machine's installed 1.91.0-nightly). Kept rolling for now
+# to avoid a full dated-toolchain download; pin a dated `nightly-YYYY-MM-DD` with
+# `profile = "minimal"` later for STD-VER-1 reproducibility once mirrored locally.
+channel = "nightly"
+components = ["rustfmt", "clippy"]

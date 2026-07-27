@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo.lock IS committed (workspace has binaries; exact-version pinning per §21)
+
+# Generated JVM cache artifacts (RJVM-SPEC-001 §26)
+*.rjvml1
+*.rjvmc
+*.ll
+
+# Differential-test compiled inputs (regenerated from testdata/java/*.java by javac)
+testdata/**/*.class
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
