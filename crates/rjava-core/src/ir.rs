@@ -73,6 +73,10 @@ pub enum Op {
     /// Bitwise AND (typed by [`Node::ty`]: int or long). Other bitwise/shift ops are added on
     /// demand in later increments.
     And,
+    /// `invokestatic` of a same-class static method, identified by its index in the class's method
+    /// table. Its `ins` are the argument values in order; `ty` is the return type (ignored for
+    /// `void`). Cross-class dispatch arrives with the loader (increment 6).
+    InvokeStatic(u16),
 }
 
 /// An SSA node: a single value definition (§9.2).

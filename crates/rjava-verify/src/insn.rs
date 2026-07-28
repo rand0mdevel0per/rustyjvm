@@ -86,6 +86,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             0x36..=0x38 => (u1_at(code, pc + 1)? as i64, 2), // istore/lstore/fstore
             0x12 => (u1_at(code, pc + 1)? as i64, 2), // ldc
             0x13 | 0x14 => (u2_at(code, pc + 1)?, 3), // ldc_w / ldc2_w
+            0xb8 => (u2_at(code, pc + 1)?, 3), // invokestatic (methodref cp index)
             0x99..=0xa4 | 0xa7 => (pc as i64 + s2_at(code, pc + 1)?, 3), // if<cond>/if_icmp/goto
             _ => return Err(VerifyError::UnsupportedOpcode { op, pc: pc as u32 }),
         };

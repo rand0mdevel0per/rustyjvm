@@ -32,14 +32,98 @@ pub enum ExecError {
     BadArgs,
     #[error("phi has no operand for the incoming control-flow edge")]
     BadPhi,
+    #[error("call stack depth exceeded (StackOverflowError)")]
+    StackOverflow,
+    #[error("no such method, or the callee failed to build")]
+    NoMethod,
 }
 
-/// Execute a built method against `args` (in declaration order), returning the result value.
+/// Maximum call-stack depth before a StackOverflowError is raised (seam; increment 8 makes this a
+/// real Java exception and configurable). Kept modest so recursion fits a test-thread stack.
+const MAX_CALL_DEPTH: usize = 1500;
+
+/// A built class: every static method built once (unbuildable ones → `None`), plus a name→index
+/// map. `invokestatic` resolves against this table and recurses into the callee. Cross-class
+/// dispatch (via the loader, §8) arrives in increment 6.
+pub struct Program {
+    methods: Vec<Option<BuiltMethod>>,
+    by_name: std::collections::HashMap<(String, String), u16>,
+}
+
+impl Program {
+    /// Verify + build every method of a class.
+    pub fn from_class(cf: &rjava_classfile::ClassFile) -> Program {
+        let mut by_name = std::collections::HashMap::new();
+        let methods = cf
+            .methods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if let (Some(n), Some(d)) =
+                    (m.name(&cf.constant_pool), m.descriptor(&cf.constant_pool))
+                {
+                    by_name.insert((n.to_string(), d.to_string()), i as u16);
+                }
+                rjava_verify::verify_method(cf, m)
+                    .ok()
+                    .and_then(|vm| rjava_ir::build(&vm, cf).ok())
+            })
+            .collect();
+        Program { methods, by_name }
+    }
+
+    /// Invoke a method by its class-table index; `None` = a `void` return.
+    pub fn call(
+        &self,
+        index: u16,
+        args: &[Val128],
+        depth: usize,
+    ) -> Result<Option<Val128>, ExecError> {
+        let built = self
+            .methods
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .ok_or(ExecError::NoMethod)?;
+        run(Some(self), built, args, depth, LogicalFrame(index as u32))
+    }
+
+    /// Invoke a method by name + descriptor (the launcher/test entry point).
+    pub fn call_named(
+        &self,
+        name: &str,
+        desc: &str,
+        args: &[Val128],
+    ) -> Result<Option<Val128>, ExecError> {
+        let idx = *self
+            .by_name
+            .get(&(name.to_string(), desc.to_string()))
+            .ok_or(ExecError::NoMethod)?;
+        self.call(idx, args, 0)
+    }
+}
+
+/// Execute a call-free built method (increment 1/2a entry point).
 pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError> {
+    run(None, built, args, 0, LogicalFrame(0))?.ok_or(ExecError::BadValue)
+}
+
+/// Execute a built method over a fresh Env register file. `program` is needed only if the method
+/// contains `invokestatic`; `depth`/`logical` thread the call stack (StackOverflow seam + logical
+/// frames, §20.7).
+fn run(
+    program: Option<&Program>,
+    built: &BuiltMethod,
+    args: &[Val128],
+    depth: usize,
+    logical: LogicalFrame,
+) -> Result<Option<Val128>, ExecError> {
+    if depth > MAX_CALL_DEPTH {
+        return Err(ExecError::StackOverflow);
+    }
     if args.len() != built.arg_vals.len() {
         return Err(ExecError::BadArgs);
     }
-    let mut env = Env::new(built.n_slots.max(1), LogicalFrame(0));
+    let mut env = Env::new(built.n_slots.max(1), logical);
     for (slot, &value) in built.arg_vals.iter().zip(args) {
         env.write_slot(SlotId(slot.offset), value);
     }
@@ -58,7 +142,7 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
             .get(cur.0 as usize)
             .ok_or(ExecError::BadBlock)?;
 
-        // Resolve φ nodes: read every source for the edge we arrived on, then write all φ slots
+        // φ resolution: read every source for the edge we arrived on, then write all φ slots
         // (parallel-copy semantics so self-referential loop φ behave correctly).
         if let Some(p) = prev {
             if !block.phis.is_empty() {
@@ -78,6 +162,17 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
         }
 
         for node in &block.nodes {
+            if let Op::InvokeStatic(index) = node.op {
+                let prog = program.ok_or(ExecError::UnsupportedOp)?;
+                let mut argv: smallvec::SmallVec<[Val128; 4]> = smallvec::SmallVec::new();
+                for v in &node.ins {
+                    argv.push(env.read_slot(SlotId(v.offset)));
+                }
+                if let Some(r) = prog.call(index, &argv, depth + 1)? {
+                    env.write_slot(SlotId(node.id.offset), r);
+                }
+                continue;
+            }
             let mut inputs: smallvec::SmallVec<[Val128; 3]> = smallvec::SmallVec::new();
             for v in &node.ins {
                 inputs.push(env.read_slot(SlotId(v.offset)));
@@ -87,8 +182,8 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
         }
 
         match &block.term {
-            Terminator::Return(Some(v)) => return Ok(env.read_slot(SlotId(v.offset))),
-            Terminator::Return(None) => return Ok(Val128::null()),
+            Terminator::Return(Some(v)) => return Ok(Some(env.read_slot(SlotId(v.offset)))),
+            Terminator::Return(None) => return Ok(None),
             Terminator::Goto(b) => {
                 prev = Some(cur);
                 cur = *b;
@@ -166,6 +261,8 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
                 _ => return Err(ExecError::UnsupportedOp),
             }
         }
+        // Calls are dispatched in `run` (they need the Program + recursion), never here.
+        Op::InvokeStatic(_) => return Err(ExecError::UnsupportedOp),
     })
 }
 
@@ -329,7 +426,7 @@ mod tests {
         let cf = rjava_classfile::parse(&bytes).unwrap();
         let arith = cf.method("arith", "(IIJF)I").unwrap();
         let vm = rjava_verify::verify_method(&cf, arith).unwrap();
-        let built = build(&vm, &cf.constant_pool).unwrap();
+        let built = build(&vm, &cf).unwrap();
 
         let run = |a: i32, b: i32, c: i64, d: f32| -> i32 {
             let args = [
@@ -532,7 +629,7 @@ public final class Oracle {
         let cf = rjava_classfile::parse(&bytes).unwrap();
         let arith = cf.method("arith", "(IIJF)I").unwrap();
         let vm = rjava_verify::verify_method(&cf, arith).unwrap();
-        let built = build(&vm, &cf.constant_pool).unwrap();
+        let built = build(&vm, &cf).unwrap();
 
         let inputs = gen_inputs();
         let Some(oracle_results) = run_oracle(&dir, &inputs) else {
@@ -658,7 +755,7 @@ public final class LoopsOracle {
         let build_m = |name: &str, desc: &str| {
             let m = cf.method(name, desc).unwrap();
             let vm = rjava_verify::verify_method(&cf, m).unwrap();
-            build(&vm, &cf.constant_pool).unwrap()
+            build(&vm, &cf).unwrap()
         };
         let sumto = build_m("sumTo", "(I)I");
         let factorial = build_m("factorial", "(I)J");
@@ -739,5 +836,191 @@ public final class LoopsOracle {
             "loops differential OK: {} cases match Corretto 21",
             cases.len()
         );
+    }
+
+    fn run_calls_oracle(dir: &std::path::Path, lines: &[String]) -> Option<Vec<i64>> {
+        use std::io::Write;
+        let stdin_data = lines.join("\n");
+        let mut child = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(dir)
+            .arg("CallsOracle")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(stdin_data.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            eprintln!(
+                "calls oracle failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().parse::<i64>().ok())
+            .collect()
+    }
+
+    /// Increment-2b conformance gate: intra-class `invokestatic`, recursion, and mutual recursion.
+    #[test]
+    fn differential_calls_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_calls: JDK unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Calls.java");
+        let dir = std::env::temp_dir().join(format!("rjava-calls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class CallsOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            int c = p.length > 3 ? Integer.parseInt(p[3]) : 0;
+            long r;
+            switch (p[0]) {
+                case "fib": r = Calls.fib(a); break;
+                case "fact": r = Calls.fact(a); break;
+                case "isEven": r = Calls.isEven(a); break;
+                case "isOdd": r = Calls.isOdd(a); break;
+                case "add": r = Calls.add(a, b); break;
+                case "addAll": r = Calls.addAll(a, b, c); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("CallsOracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("CallsOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping differential_calls: javac cannot target --release 21");
+            return;
+        }
+
+        let bytes = std::fs::read(dir.join("Calls.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        // (method, descriptor, a, b, c, result_is_long)
+        let mut cases: Vec<(&str, &str, i32, i32, i32, bool)> = Vec::new();
+        for n in 0..=25 {
+            cases.push(("fib", "(I)I", n, 0, 0, false));
+        }
+        for n in 0..=20 {
+            cases.push(("fact", "(I)J", n, 0, 0, true));
+        }
+        for n in [0, 1, 2, 3, 10, 50, 99, 100, 200, 300] {
+            cases.push(("isEven", "(I)I", n, 0, 0, false));
+            cases.push(("isOdd", "(I)I", n, 0, 0, false));
+        }
+        for (a, b) in [(3, 4), (-5, 10), (i32::MAX, 1), (i32::MIN, -1), (0, 0)] {
+            cases.push(("add", "(II)I", a, b, 0, false));
+        }
+        for (a, b, c) in [(1, 2, 3), (-1, -2, -3), (i32::MAX, 1, 1), (100, 200, 300)] {
+            cases.push(("addAll", "(III)I", a, b, c, false));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b, c, _)| format!("{m} {a} {b} {c}"))
+            .collect();
+        let Some(oracle_results) = run_calls_oracle(&dir, &lines) else {
+            eprintln!("skipping differential_calls: could not run the oracle");
+            return;
+        };
+        assert_eq!(oracle_results.len(), cases.len());
+
+        for ((m, desc, a, b, c, is_long), &expected) in cases.iter().zip(&oracle_results) {
+            let args: Vec<Val128> = match *desc {
+                "(II)I" => vec![Val128::from_i32(*a), Val128::from_i32(*b)],
+                "(III)I" => vec![
+                    Val128::from_i32(*a),
+                    Val128::from_i32(*b),
+                    Val128::from_i32(*c),
+                ],
+                _ => vec![Val128::from_i32(*a)],
+            };
+            let r = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b},{c}) failed: {e:?}"))
+                .expect("non-void return");
+            let got = if *is_long {
+                r.as_i64()
+            } else {
+                r.as_i32() as i64
+            };
+            assert_eq!(
+                got, expected,
+                "{m}({a}, {b}, {c}) diverged from Corretto 21"
+            );
+        }
+        eprintln!(
+            "calls differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
+    }
+
+    /// Increment-2b StackOverflow seam: unbounded recursion must raise `StackOverflow`, not crash.
+    /// Runs on a large stack so the host can hold MAX_CALL_DEPTH frames.
+    #[test]
+    fn stack_overflow_on_infinite_recursion() {
+        if !tool_ok("javac") {
+            eprintln!("skipping stack_overflow: javac unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Calls.java");
+        let dir = std::env::temp_dir().join(format!("rjava-soe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping stack_overflow: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Calls.class")).unwrap();
+        let result = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let cf = rjava_classfile::parse(&bytes).unwrap();
+                let program = Program::from_class(&cf);
+                program.call_named("deep", "(I)I", &[Val128::from_i32(0)])
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            result,
+            Err(ExecError::StackOverflow),
+            "unbounded recursion must raise StackOverflow, got {result:?}"
+        );
+        eprintln!("StackOverflow seam OK: deep(0) -> {result:?}");
     }
 }

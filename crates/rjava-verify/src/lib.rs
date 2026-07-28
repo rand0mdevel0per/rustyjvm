@@ -242,6 +242,39 @@ fn ldc_type(cp: &ConstantPool, index: i64, pc: u32) -> Result<VType, VerifyError
     }
 }
 
+/// Argument and return verification types of the method a `Methodref` names.
+fn methodref_descriptor(
+    cp: &ConstantPool,
+    index: u16,
+    pc: u32,
+) -> Result<(Vec<VType>, Option<VType>), VerifyError> {
+    let nat = match cp.get(index) {
+        Some(Constant::MethodRef {
+            name_and_type_index,
+            ..
+        }) => *name_and_type_index,
+        _ => {
+            return Err(VerifyError::TypeMismatch {
+                pc,
+                what: "invokestatic operand not a Methodref",
+            })
+        }
+    };
+    let desc_idx = match cp.get(nat) {
+        Some(Constant::NameAndType {
+            descriptor_index, ..
+        }) => *descriptor_index,
+        _ => {
+            return Err(VerifyError::TypeMismatch {
+                pc,
+                what: "bad NameAndType",
+            })
+        }
+    };
+    let desc = cp.utf8(desc_idx).ok_or(VerifyError::BadDescriptor)?;
+    parse_method_descriptor(desc)
+}
+
 fn load(
     f: &mut AbstractFrame,
     idx: u16,
@@ -433,6 +466,16 @@ fn apply(
                 return Err(VerifyError::BadReturn(pc));
             }
         } // lreturn
+        0xb8 => {
+            // invokestatic: pop arguments (in reverse) per the target descriptor, push the return.
+            let (arg_ty, ret_ty) = methodref_descriptor(cp, ins.arg as u16, pc)?;
+            for &t in arg_ty.iter().rev() {
+                f.pop_expect(t, pc)?;
+            }
+            if let Some(r) = ret_ty {
+                f.push(r, max_stack, pc)?;
+            }
+        }
         _ => return Err(VerifyError::UnsupportedOpcode { op: ins.op, pc }),
     }
     Ok(())

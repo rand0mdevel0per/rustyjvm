@@ -12,11 +12,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rjava_classfile::{Constant, ConstantPool};
+use rjava_classfile::{ClassFile, Constant, ConstantPool};
 use rjava_core::{
     Block, BlockId, Effect, IntCond, Method, Node, Op, Phi, Tag, Terminator, Val128, ValId,
 };
-use rjava_verify::{Insn, VerifiedMethod};
+use rjava_verify::{parse_method_descriptor, Insn, VType, VerifiedMethod};
 use smallvec::{smallvec, SmallVec};
 
 /// Failure while building L1 IR. For verified input these are unreachable; they exist so the
@@ -55,6 +55,47 @@ fn cp_const(cp: &ConstantPool, index: i64, pc: u32) -> Result<Val128, IrError> {
         Some(Constant::Double(v)) => Val128::from_f64(*v),
         _ => return Err(IrError::BadConstant(pc)),
     })
+}
+
+/// Resolve an `invokestatic` methodref to a same-class method index and its descriptor types.
+/// Increment 2b supports intra-class static calls only; cross-class dispatch awaits the loader (§8).
+fn resolve_invokestatic(
+    cf: &ClassFile,
+    cpidx: u16,
+    pc: u32,
+) -> Result<(u16, Vec<VType>, Option<VType>), IrError> {
+    let cp = &cf.constant_pool;
+    let (class_index, nat_index) = match cp.get(cpidx) {
+        Some(Constant::MethodRef {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => return Err(IrError::Unsupported { op: 0xb8, pc }),
+    };
+    if cp.class_name(class_index) != cf.this_class_name() {
+        return Err(IrError::Unsupported { op: 0xb8, pc });
+    }
+    let (name_index, desc_index) = match cp.get(nat_index) {
+        Some(Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        }) => (*name_index, *descriptor_index),
+        _ => return Err(IrError::Unsupported { op: 0xb8, pc }),
+    };
+    let name = cp
+        .utf8(name_index)
+        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
+    let desc = cp
+        .utf8(desc_index)
+        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
+    let mindex = cf
+        .methods
+        .iter()
+        .position(|m| m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc))
+        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
+    let (arg_ty, ret_ty) =
+        parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb8, pc })?;
+    Ok((mindex as u16, arg_ty, ret_ty))
 }
 
 fn if_cond(op: u8) -> IntCond {
@@ -267,6 +308,7 @@ impl Ssa {
         &mut self,
         block: BlockId,
         insns: &[Insn],
+        cf: &ClassFile,
         cp: &ConstantPool,
         block_of: &HashMap<u32, BlockId>,
         nodes: &mut Vec<Node>,
@@ -439,6 +481,33 @@ impl Ssa {
                     let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     term = Some(Terminator::Return(Some(v)));
                 }
+                0xb8 => {
+                    // invokestatic: pop the arguments (reverse), emit a call node, push the result.
+                    let (mindex, arg_ty, ret_ty) = resolve_invokestatic(cf, ins.arg as u16, pc)?;
+                    let mut args: SmallVec<[ValId; 3]> = SmallVec::new();
+                    for _ in 0..arg_ty.len() {
+                        args.push(stack.pop().ok_or(IrError::StackUnderflow(pc))?);
+                    }
+                    args.reverse();
+                    let ty = match ret_ty {
+                        None | Some(VType::Int) => Tag::I32, // void: placeholder, never pushed
+                        Some(VType::Long) => Tag::I64,
+                        Some(VType::Float) => Tag::F32,
+                        Some(VType::Double) => Tag::F64,
+                        Some(_) => return Err(IrError::Unsupported { op: 0xb8, pc }),
+                    };
+                    let id = self.fresh()?;
+                    nodes.push(Node {
+                        id,
+                        op: Op::InvokeStatic(mindex),
+                        ins: args,
+                        ty,
+                        effect: Effect::Extern,
+                    });
+                    if ret_ty.is_some() {
+                        stack.push(id);
+                    }
+                }
                 _ => return Err(IrError::Unsupported { op: ins.op, pc }),
             }
         }
@@ -529,7 +598,8 @@ fn reverse_postorder(
 }
 
 /// Build the L1 SSA form of a verified method.
-pub fn build(vm: &VerifiedMethod, cp: &ConstantPool) -> Result<BuiltMethod, IrError> {
+pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError> {
+    let cp = &cf.constant_pool;
     let valid: HashMap<u32, usize> = vm
         .insns
         .iter()
@@ -627,7 +697,7 @@ pub fn build(vm: &VerifiedMethod, cp: &ConstantPool) -> Result<BuiltMethod, IrEr
         let bidx = b.0 as usize;
         if bidx < nblocks {
             let mut nodes = Vec::new();
-            let term = ssa.process_block(b, &block_insns[bidx], cp, &block_of, &mut nodes)?;
+            let term = ssa.process_block(b, &block_insns[bidx], cf, cp, &block_of, &mut nodes)?;
             nodes_of[bidx] = nodes;
             term_of[bidx] = Some(term.unwrap_or_else(|| {
                 // Fall-through into the next block in pc order.
@@ -715,7 +785,7 @@ mod tests {
         let cf = rjava_classfile::parse(&bytes).unwrap();
         let m = cf.method("sumTo", "(I)I").unwrap();
         let vm = rjava_verify::verify_method(&cf, m).unwrap();
-        let built = build(&vm, &cf.constant_pool).unwrap();
+        let built = build(&vm, &cf).unwrap();
         // The loop header must carry φ nodes for the loop-carried locals (s, i).
         let total_phis: usize = built.method.blocks.iter().map(|b| b.phis.len()).sum();
         assert!(
