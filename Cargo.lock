@@ -274,10 +274,14 @@ dependencies = [
 name = "rjava-interp"
 version = "0.0.0"
 dependencies = [
+ "rjava-classfile",
  "rjava-core",
  "rjava-gc",
  "rjava-ir",
  "rjava-loader",
+ "rjava-verify",
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]

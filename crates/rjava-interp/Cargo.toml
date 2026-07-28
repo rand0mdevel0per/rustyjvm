@@ -11,3 +11,9 @@ rjava-core = { workspace = true }
 rjava-ir = { workspace = true }
 rjava-gc = { workspace = true }
 rjava-loader = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rjava-classfile = { workspace = true }
+rjava-verify = { workspace = true }
