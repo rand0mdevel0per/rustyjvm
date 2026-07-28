@@ -1,35 +1,22 @@
 public final class Calls {
-    // Increment-2b fixtures: intra-class static calls, recursion, mutual recursion, and an
-    // unbounded recursion for the StackOverflowError seam. Written in if-return style so operand
-    // stacks are empty at basic-block boundaries (ternary `?:` leaves a value on the stack at the
-    // merge — that non-empty-stack SSA case is a separate IR enhancement, added when needed).
+    // Increment-2b + stack-φ: intra-class static calls with native ternary `?:` (which leaves a
+    // value on the operand stack at the merge — exercised via φ over stack slots), recursion,
+    // mutual recursion, and an unbounded recursion for the StackOverflowError seam.
 
     public static int fib(int n) {
-        if (n < 2) {
-            return n;
-        }
-        return fib(n - 1) + fib(n - 2);
+        return n < 2 ? n : fib(n - 1) + fib(n - 2);
     }
 
     public static long fact(int n) {
-        if (n <= 1) {
-            return 1L;
-        }
-        return (long) n * fact(n - 1);
+        return n <= 1 ? 1L : (long) n * fact(n - 1);
     }
 
     public static int isEven(int n) {
-        if (n == 0) {
-            return 1;
-        }
-        return isOdd(n - 1);
+        return n == 0 ? 1 : isOdd(n - 1);
     }
 
     public static int isOdd(int n) {
-        if (n == 0) {
-            return 0;
-        }
-        return isEven(n - 1);
+        return n == 0 ? 0 : isEven(n - 1);
     }
 
     public static int add(int a, int b) {

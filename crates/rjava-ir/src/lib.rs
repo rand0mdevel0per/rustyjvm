@@ -57,6 +57,13 @@ fn cp_const(cp: &ConstantPool, index: i64, pc: u32) -> Result<Val128, IrError> {
     })
 }
 
+/// The SSA "variable" id for operand-stack position `pos` (item model). Stack positions live above
+/// the locals, so a merge point can carry a φ over stack slots (non-empty-stack merges, e.g.
+/// ternary `?:`), exactly as it does for locals.
+fn stack_var(max_locals: u16, pos: usize) -> Result<u16, IrError> {
+    u16::try_from(max_locals as usize + pos).map_err(|_| IrError::TooManyValues)
+}
+
 /// Resolve an `invokestatic` methodref to a same-class method index and its descriptor types.
 /// Increment 2b supports intra-class static calls only; cross-class dispatch awaits the loader (§8).
 fn resolve_invokestatic(
@@ -311,9 +318,17 @@ impl Ssa {
         cf: &ClassFile,
         cp: &ConstantPool,
         block_of: &HashMap<u32, BlockId>,
+        max_locals: u16,
+        entry_depth: usize,
         nodes: &mut Vec<Node>,
-    ) -> Result<Option<Terminator>, IrError> {
-        let mut stack: Vec<ValId> = Vec::new();
+    ) -> Result<(Option<Terminator>, usize), IrError> {
+        // Initialise the operand stack from the incoming edge by reading stack-position variables;
+        // φ over these slots handles non-empty-stack merges (ternary `?:`).
+        let mut stack: Vec<ValId> = Vec::with_capacity(entry_depth);
+        for s in 0..entry_depth {
+            let v = self.read_variable(stack_var(max_locals, s)?, block)?;
+            stack.push(v);
+        }
         let mut term: Option<Terminator> = None;
         for ins in insns {
             let pc = ins.pc;
@@ -511,7 +526,12 @@ impl Ssa {
                 _ => return Err(IrError::Unsupported { op: ins.op, pc }),
             }
         }
-        Ok(term)
+        // Record the exit operand stack so successors' φ can read these positions.
+        for (s, &v) in stack.iter().enumerate() {
+            let sv = stack_var(max_locals, s)?;
+            self.write_variable(sv, block, v);
+        }
+        Ok((term, stack.len()))
     }
 }
 
@@ -683,6 +703,7 @@ pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError
     // Process blocks in RPO, sealing each as soon as all its predecessors are processed.
     let mut nodes_of: Vec<Vec<Node>> = (0..total).map(|_| Vec::new()).collect();
     let mut term_of: Vec<Option<Terminator>> = (0..total).map(|_| None).collect();
+    let mut exit_depth: HashMap<BlockId, usize> = HashMap::new();
     let mut processed: HashSet<BlockId> = HashSet::new();
     let all_processed = |b: BlockId, ssa: &Ssa, processed: &HashSet<BlockId>| {
         ssa.preds
@@ -696,8 +717,30 @@ pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError
         }
         let bidx = b.0 as usize;
         if bidx < nblocks {
+            // Entry operand-stack depth: the StackMapTable frame at the leader (item model), else a
+            // processed predecessor's exit depth (fall-through), else 0 (method entry).
+            let entry_depth = if b == entry {
+                0
+            } else if let Some(f) = vm.frames.get(&leader_pcs[bidx]) {
+                f.stack.len()
+            } else {
+                ssa.preds
+                    .get(&b)
+                    .and_then(|ps| ps.iter().find_map(|p| exit_depth.get(p).copied()))
+                    .unwrap_or(0)
+            };
             let mut nodes = Vec::new();
-            let term = ssa.process_block(b, &block_insns[bidx], cf, cp, &block_of, &mut nodes)?;
+            let (term, exit_d) = ssa.process_block(
+                b,
+                &block_insns[bidx],
+                cf,
+                cp,
+                &block_of,
+                vm.max_locals,
+                entry_depth,
+                &mut nodes,
+            )?;
+            exit_depth.insert(b, exit_d);
             nodes_of[bidx] = nodes;
             term_of[bidx] = Some(term.unwrap_or_else(|| {
                 // Fall-through into the next block in pc order.
@@ -705,6 +748,7 @@ pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError
             }));
         } else {
             // Synthetic entry block: jump to the real first block.
+            exit_depth.insert(b, 0);
             term_of[bidx] = Some(Terminator::Goto(BlockId(0)));
         }
         processed.insert(b);

@@ -838,13 +838,13 @@ public final class LoopsOracle {
         );
     }
 
-    fn run_calls_oracle(dir: &std::path::Path, lines: &[String]) -> Option<Vec<i64>> {
+    fn run_named_oracle(dir: &std::path::Path, class: &str, lines: &[String]) -> Option<Vec<i64>> {
         use std::io::Write;
         let stdin_data = lines.join("\n");
         let mut child = std::process::Command::new("java")
             .arg("-cp")
             .arg(dir)
-            .arg("CallsOracle")
+            .arg(class)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -946,7 +946,7 @@ public final class CallsOracle {
             .iter()
             .map(|(m, _, a, b, c, _)| format!("{m} {a} {b} {c}"))
             .collect();
-        let Some(oracle_results) = run_calls_oracle(&dir, &lines) else {
+        let Some(oracle_results) = run_named_oracle(&dir, "CallsOracle", &lines) else {
             eprintln!("skipping differential_calls: could not run the oracle");
             return;
         };
@@ -1022,5 +1022,137 @@ public final class CallsOracle {
             "unbounded recursion must raise StackOverflow, got {result:?}"
         );
         eprintln!("StackOverflow seam OK: deep(0) -> {result:?}");
+    }
+
+    /// Stack-φ conformance: native ternary `?:` (including nested) is lowered via φ over
+    /// operand-stack slots; every result must match Corretto 21.
+    #[test]
+    fn differential_ternary_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_ternary: JDK unavailable");
+            return;
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/java/Ternary.java");
+        let dir = std::env::temp_dir().join(format!("rjava-tern-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class TernaryOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            int c = p.length > 3 ? Integer.parseInt(p[3]) : 0;
+            int r;
+            switch (p[0]) {
+                case "max": r = Ternary.max(a, b); break;
+                case "min": r = Ternary.min(a, b); break;
+                case "abs": r = Ternary.abs(a); break;
+                case "sign": r = Ternary.sign(a); break;
+                case "clamp": r = Ternary.clamp(a, b, c); break;
+                case "med3": r = Ternary.med3(a, b, c); break;
+                case "select": r = Ternary.select(a, b, c); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("TernaryOracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("TernaryOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping differential_ternary: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Ternary.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        let vals = [
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            5,
+            -5,
+            100,
+            -100,
+            42,
+            -42,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN + 1,
+            i32::MAX - 1,
+        ];
+        let mut cases: Vec<(&str, &str, i32, i32, i32)> = Vec::new();
+        for &n in &vals {
+            cases.push(("abs", "(I)I", n, 0, 0));
+            cases.push(("sign", "(I)I", n, 0, 0));
+        }
+        for &a in &vals {
+            for &b in &[0, 1, -1, 100, -100, i32::MIN, i32::MAX] {
+                cases.push(("max", "(II)I", a, b, 0));
+                cases.push(("min", "(II)I", a, b, 0));
+            }
+        }
+        let mut s: u64 = 0x1357_9BDF_2468_ACE0;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s
+        };
+        for _ in 0..80 {
+            let (a, b, c) = (next() as i32, next() as i32, next() as i32);
+            cases.push(("clamp", "(III)I", a, b, c));
+            cases.push(("med3", "(III)I", a, b, c));
+            cases.push(("select", "(III)I", a, b, c));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b, c)| format!("{m} {a} {b} {c}"))
+            .collect();
+        let Some(oracle_results) = run_named_oracle(&dir, "TernaryOracle", &lines) else {
+            eprintln!("skipping differential_ternary: could not run the oracle");
+            return;
+        };
+        assert_eq!(oracle_results.len(), cases.len());
+
+        for ((m, desc, a, b, c), &expected) in cases.iter().zip(&oracle_results) {
+            let args: Vec<Val128> = match *desc {
+                "(I)I" => vec![Val128::from_i32(*a)],
+                "(II)I" => vec![Val128::from_i32(*a), Val128::from_i32(*b)],
+                _ => vec![
+                    Val128::from_i32(*a),
+                    Val128::from_i32(*b),
+                    Val128::from_i32(*c),
+                ],
+            };
+            let r = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b},{c}) failed: {e:?}"))
+                .expect("non-void return")
+                .as_i32() as i64;
+            assert_eq!(r, expected, "{m}({a}, {b}, {c}) diverged from Corretto 21");
+        }
+        eprintln!(
+            "ternary differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
     }
 }
