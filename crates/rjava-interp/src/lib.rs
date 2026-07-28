@@ -299,4 +299,222 @@ mod tests {
         assert_eq!(run(50, 3, 100, 200.0), -53); // first: (int)(t-(long)u)+s
         assert_eq!(run(2, 0, 0, 0.0), 0); // else-if: s*s (s==0)
     }
+
+    fn tool_ok(name: &str) -> bool {
+        std::process::Command::new(name)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// A diverse input set for `arith`: boundary values, NaN/Inf/subnormals, and deterministic
+    /// pseudo-random tuples. `b == -1` is excluded so `a / (b + 1)` never divides by zero (integer
+    /// division traps arrive in increment 8).
+    fn gen_inputs() -> Vec<(i32, i32, i64, f32)> {
+        let ints = [
+            0i32,
+            1,
+            -1,
+            2,
+            -2,
+            3,
+            -3,
+            7,
+            -7,
+            100,
+            -100,
+            46340,
+            -46340,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN + 1,
+            i32::MAX - 1,
+        ];
+        let longs = [
+            0i64,
+            1,
+            -1,
+            2,
+            -2,
+            100,
+            -100,
+            1 << 40,
+            -(1 << 40),
+            i64::MIN,
+            i64::MAX,
+        ];
+        let floats = [
+            0.0f32,
+            -0.0,
+            1.5,
+            -3.25,
+            100.5,
+            999.9,
+            1000.0,
+            1e30,
+            -1e30,
+            0.1,
+            f32::MIN_POSITIVE,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let mut out = Vec::new();
+        for &a in &ints {
+            for &b in &ints {
+                if b == -1 {
+                    continue;
+                }
+                out.push((a, b, 100, 200.0));
+                out.push((a, b, i64::MAX, f32::NAN));
+            }
+        }
+        for &c in &longs {
+            for &d in &floats {
+                out.push((50, 3, c, d));
+                out.push((1, 2, c, d));
+            }
+        }
+        // Deterministic LCG (no rand dependency); vary widely across the whole domain.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s
+        };
+        for _ in 0..400 {
+            let a = next() as i32;
+            let mut b = next() as i32;
+            if b == -1 {
+                b = 0;
+            }
+            let c = next() as i64;
+            let d = f32::from_bits(next() as u32);
+            out.push((a, b, c, d));
+        }
+        out
+    }
+
+    /// Run the Corretto oracle: reconstruct each float from its raw bits, invoke `Slice.arith`, and
+    /// return one result per input line.
+    fn run_oracle(dir: &std::path::Path, inputs: &[(i32, i32, i64, f32)]) -> Option<Vec<i32>> {
+        use std::io::Write;
+        let mut stdin_data = String::new();
+        for &(a, b, c, d) in inputs {
+            use std::fmt::Write as _;
+            writeln!(stdin_data, "{} {} {} {}", a, b, c, d.to_bits() as i32).unwrap();
+        }
+        let mut child = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(dir)
+            .arg("Oracle")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(stdin_data.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            eprintln!("oracle failed: {}", String::from_utf8_lossy(&out.stderr));
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().parse::<i32>().ok())
+            .collect()
+    }
+
+    /// The increment-1 conformance gate (§P-5, §23.1): RustyJVM's `arith` result MUST equal
+    /// Corretto 21's for every input. Skips when the JDK is absent (runs in the CI `differential`
+    /// job, which provisions Corretto 21).
+    #[test]
+    fn differential_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_vs_corretto_21: JDK unavailable");
+            return;
+        }
+        let slice_src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Slice.java");
+        let dir = std::env::temp_dir().join(format!("rjava-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A tiny reflective oracle driver, compiled together with Slice.
+        let oracle = r#"
+import java.io.*;
+public final class Oracle {
+    public static void main(String[] a) throws Exception {
+        var m = Slice.class.getMethod("arith", int.class, int.class, long.class, float.class);
+        var r = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = r.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int ia = Integer.parseInt(p[0]), ib = Integer.parseInt(p[1]);
+            long c = Long.parseLong(p[2]);
+            float d = Float.intBitsToFloat(Integer.parseInt(p[3]));
+            sb.append((int) m.invoke(null, ia, ib, c, d)).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("Oracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&slice_src)
+            .arg(dir.join("Oracle.java"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(compiled, "javac must compile Slice.java + Oracle.java");
+
+        // RustyJVM pipeline.
+        let bytes = std::fs::read(dir.join("Slice.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let arith = cf.method("arith", "(IIJF)I").unwrap();
+        let vm = rjava_verify::verify_method(&cf, arith).unwrap();
+        let built = build(&vm, &cf.constant_pool).unwrap();
+
+        let inputs = gen_inputs();
+        let oracle_results = run_oracle(&dir, &inputs).expect("Corretto oracle must run");
+        assert_eq!(
+            oracle_results.len(),
+            inputs.len(),
+            "oracle produced one result per input"
+        );
+
+        let mut mismatches = 0;
+        for (&(a, b, c, d), &expected) in inputs.iter().zip(&oracle_results) {
+            let args = [
+                Val128::from_i32(a),
+                Val128::from_i32(b),
+                Val128::from_i64(c),
+                Val128::from_f32(d),
+            ];
+            let got = execute(&built, &args).unwrap().as_i32();
+            if got != expected {
+                if mismatches < 10 {
+                    eprintln!(
+                        "MISMATCH arith({a}, {b}, {c}L, {}f/{:#010x}) = rjvm {got} vs corretto {expected}",
+                        d, d.to_bits()
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "{mismatches}/{} inputs diverged from Corretto 21",
+            inputs.len()
+        );
+        eprintln!("differential OK: {} inputs match Corretto 21", inputs.len());
+    }
 }
