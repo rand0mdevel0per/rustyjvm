@@ -287,6 +287,8 @@ dependencies = [
  "rjava-classfile",
  "rjava-core",
  "rjava-verify",
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]

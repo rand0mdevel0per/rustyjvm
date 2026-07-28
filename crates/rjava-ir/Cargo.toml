@@ -10,3 +10,5 @@ repository.workspace = true
 rjava-core = { workspace = true }
 rjava-classfile = { workspace = true }
 rjava-verify = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
