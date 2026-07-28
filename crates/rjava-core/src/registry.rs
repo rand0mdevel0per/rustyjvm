@@ -211,4 +211,17 @@ mod tests {
             }
         );
     }
+
+    /// On tier-1 targets (x86-64 `cmpxchg16b`; AArch64 `LDXP`/`STXP` or LSE `CASP`) the
+    /// control-block's 128-bit atomics MUST be lock-free (§12.6); `portable-atomic`'s `fallback`
+    /// keeps them merely correct elsewhere. Asserting it here makes "we are on the lock-free path"
+    /// observable at test time, so a silent regression to the lock path is caught.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn control_block_128bit_atomics_are_lock_free() {
+        assert!(
+            portable_atomic::AtomicU128::is_lock_free(),
+            "128-bit control-block atomics are not lock-free on this target (§12.6)"
+        );
+    }
 }
