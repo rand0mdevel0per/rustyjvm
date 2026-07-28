@@ -33,6 +33,17 @@ pub enum Effect {
     MayThrow { caught: bool },
 }
 
+/// Integer comparison against zero — the condition of a JVM `if<cond>` branch (JVMS §6.5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntCond {
+    Eq,
+    Ne,
+    Lt,
+    Ge,
+    Gt,
+    Le,
+}
+
 /// SSA operation kind. Typed by [`Node::ty`], so a single arithmetic variant serves int/long/float
 /// (§9.2 — "ty is the static type fixed by verification"). Extended per increment; this is the
 /// increment-1 arithmetic / convert / compare core.
@@ -54,6 +65,9 @@ pub enum Op {
     Cmp {
         nan_greater: bool,
     },
+    /// `(input <cond> 0) ? 1 : 0`, as int. Produced for `if<cond>` so a nonzero-testing
+    /// [`Terminator::CondBranch`] can express the JVM branch condition.
+    TestZero(IntCond),
 }
 
 /// An SSA node: a single value definition (§9.2).
