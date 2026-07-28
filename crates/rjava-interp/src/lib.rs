@@ -1155,4 +1155,118 @@ public final class TernaryOracle {
             cases.len()
         );
     }
+
+    /// Interaction (联动) gate: loops + recursive/iterative calls + ternary + int/long arithmetic
+    /// combined in single methods, all matching Corretto 21.
+    #[test]
+    fn differential_mixed_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_mixed: JDK unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Mixed.java");
+        let dir = std::env::temp_dir().join(format!("rjava-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class MixedOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            long r;
+            switch (p[0]) {
+                case "fib": r = Mixed.fib(a); break;
+                case "gcd": r = Mixed.gcd(a, b); break;
+                case "sumFibSigned": r = Mixed.sumFibSigned(a); break;
+                case "totient": r = Mixed.totient(a); break;
+                case "collatzLen": r = Mixed.collatzLen(a); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("MixedOracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("MixedOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping differential_mixed: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Mixed.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        // (method, descriptor, a, b, result_is_long)
+        let mut cases: Vec<(&str, &str, i32, i32, bool)> = Vec::new();
+        for n in 0..=25 {
+            cases.push(("fib", "(I)I", n, 0, false));
+        }
+        for (a, b) in [
+            (48, 18),
+            (0, 7),
+            (7, 0),
+            (270, 192),
+            (i32::MAX, 3),
+            (-12, 8),
+        ] {
+            cases.push(("gcd", "(II)I", a, b, false));
+        }
+        for n in 0..=22 {
+            cases.push(("sumFibSigned", "(I)J", n, 0, true));
+        }
+        for n in [1, 2, 3, 6, 10, 12, 36, 97, 100, 200, 360] {
+            cases.push(("totient", "(I)I", n, 0, false));
+        }
+        for n in [1, 2, 3, 6, 7, 27, 97, 255, 511, 1000] {
+            cases.push(("collatzLen", "(I)I", n, 0, false));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b, _)| format!("{m} {a} {b}"))
+            .collect();
+        let Some(oracle_results) = run_named_oracle(&dir, "MixedOracle", &lines) else {
+            eprintln!("skipping differential_mixed: could not run the oracle");
+            return;
+        };
+        assert_eq!(oracle_results.len(), cases.len());
+
+        for ((m, desc, a, b, is_long), &expected) in cases.iter().zip(&oracle_results) {
+            let args: Vec<Val128> = if *desc == "(II)I" {
+                vec![Val128::from_i32(*a), Val128::from_i32(*b)]
+            } else {
+                vec![Val128::from_i32(*a)]
+            };
+            let r = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b}) failed: {e:?}"))
+                .expect("non-void return");
+            let got = if *is_long {
+                r.as_i64()
+            } else {
+                r.as_i32() as i64
+            };
+            assert_eq!(got, expected, "{m}({a}, {b}) diverged from Corretto 21");
+        }
+        eprintln!(
+            "mixed (interaction) differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
+    }
 }

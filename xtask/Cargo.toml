@@ -8,3 +8,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+rjava-core = { workspace = true }
+rjava-classfile = { workspace = true }
+rjava-verify = { workspace = true }
+rjava-ir = { workspace = true }
+rjava-interp = { workspace = true }

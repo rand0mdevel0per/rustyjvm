@@ -1,0 +1,3 @@
+# `cargo benchmark-test` runs the RustyJVM micro-benchmarks (release) via xtask.
+[alias]
+benchmark-test = "run --release --package xtask -- bench"
