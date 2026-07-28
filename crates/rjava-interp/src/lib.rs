@@ -9,8 +9,7 @@
 //! match the JVM's `iadd`/`ldiv`/`f2i`/… semantics exactly, which is what makes the differential
 //! results bit-identical to Corretto.
 
-use rjava_core::Terminator;
-use rjava_core::{Env, IntCond, LogicalFrame, Op, SlotId, Tag, Val128};
+use rjava_core::{BlockId, Env, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator, Val128};
 use rjava_ir::BuiltMethod;
 
 /// A runtime failure. Increment 1 cannot yet raise Java exceptions (those arrive in increment 8);
@@ -31,6 +30,8 @@ pub enum ExecError {
     BadBlock,
     #[error("argument count mismatch")]
     BadArgs,
+    #[error("phi has no operand for the incoming control-flow edge")]
+    BadPhi,
 }
 
 /// Execute a built method against `args` (in declaration order), returning the result value.
@@ -44,6 +45,7 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
     }
 
     let mut cur = built.method.entry;
+    let mut prev: Option<BlockId> = None;
     let mut steps: u64 = 0;
     loop {
         steps += 1;
@@ -55,6 +57,25 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
             .blocks
             .get(cur.0 as usize)
             .ok_or(ExecError::BadBlock)?;
+
+        // Resolve φ nodes: read every source for the edge we arrived on, then write all φ slots
+        // (parallel-copy semantics so self-referential loop φ behave correctly).
+        if let Some(p) = prev {
+            if !block.phis.is_empty() {
+                let mut writes: smallvec::SmallVec<[(u16, Val128); 4]> = smallvec::SmallVec::new();
+                for phi in &block.phis {
+                    let (_, v) = phi
+                        .sources
+                        .iter()
+                        .find(|(pb, _)| *pb == p)
+                        .ok_or(ExecError::BadPhi)?;
+                    writes.push((phi.slot.offset, env.read_slot(SlotId(v.offset))));
+                }
+                for (slot, val) in writes {
+                    env.write_slot(SlotId(slot), val);
+                }
+            }
+        }
 
         for node in &block.nodes {
             let mut inputs: smallvec::SmallVec<[Val128; 3]> = smallvec::SmallVec::new();
@@ -68,13 +89,17 @@ pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError
         match &block.term {
             Terminator::Return(Some(v)) => return Ok(env.read_slot(SlotId(v.offset))),
             Terminator::Return(None) => return Ok(Val128::null()),
-            Terminator::Goto(b) => cur = *b,
+            Terminator::Goto(b) => {
+                prev = Some(cur);
+                cur = *b;
+            }
             Terminator::CondBranch {
                 cond,
                 taken,
                 not_taken,
             } => {
                 let c = env.read_slot(SlotId(cond.offset)).as_i32();
+                prev = Some(cur);
                 cur = if c != 0 { *taken } else { *not_taken };
             }
             Terminator::Throw(_) => return Err(ExecError::Thrown),
@@ -118,6 +143,28 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
                 IntCond::Le => v <= 0,
             };
             Val128::from_i32(taken as i32)
+        }
+        Op::ICmp(cond) => {
+            let a = ins.first().ok_or(ExecError::BadValue)?.as_i32();
+            let b = ins.get(1).ok_or(ExecError::BadValue)?.as_i32();
+            let taken = match cond {
+                IntCond::Eq => a == b,
+                IntCond::Ne => a != b,
+                IntCond::Lt => a < b,
+                IntCond::Ge => a >= b,
+                IntCond::Gt => a > b,
+                IntCond::Le => a <= b,
+            };
+            Val128::from_i32(taken as i32)
+        }
+        Op::And => {
+            let a = *ins.first().ok_or(ExecError::BadValue)?;
+            let b = *ins.get(1).ok_or(ExecError::BadValue)?;
+            match ty {
+                Tag::I32 => Val128::from_i32(a.as_i32() & b.as_i32()),
+                Tag::I64 => Val128::from_i64(a.as_i64() & b.as_i64()),
+                _ => return Err(ExecError::UnsupportedOp),
+            }
         }
     })
 }
@@ -524,5 +571,173 @@ public final class Oracle {
             inputs.len()
         );
         eprintln!("differential OK: {} inputs match Corretto 21", inputs.len());
+    }
+
+    fn run_loops_oracle(dir: &std::path::Path, lines: &[String]) -> Option<Vec<i64>> {
+        use std::io::Write;
+        let stdin_data = lines.join("\n");
+        let mut child = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(dir)
+            .arg("LoopsOracle")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(stdin_data.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            eprintln!(
+                "loops oracle failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().parse::<i64>().ok())
+            .collect()
+    }
+
+    /// Increment-2 conformance gate: loops (real φ), `iinc`, `if_icmp`, `iand`, `lreturn` — every
+    /// result must match Corretto 21. Inputs are bounded per method so the loops terminate.
+    #[test]
+    fn differential_loops_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_loops: JDK unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Loops.java");
+        let dir = std::env::temp_dir().join(format!("rjava-loops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class LoopsOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            long r;
+            switch (p[0]) {
+                case "sumTo": r = Loops.sumTo(a); break;
+                case "factorial": r = Loops.factorial(a); break;
+                case "fib": r = Loops.fib(a); break;
+                case "gcd": r = Loops.gcd(a, b); break;
+                case "collatz": r = Loops.collatz(a); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("LoopsOracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("LoopsOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping differential_loops: javac cannot target --release 21");
+            return;
+        }
+
+        let bytes = std::fs::read(dir.join("Loops.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let build_m = |name: &str, desc: &str| {
+            let m = cf.method(name, desc).unwrap();
+            let vm = rjava_verify::verify_method(&cf, m).unwrap();
+            build(&vm, &cf.constant_pool).unwrap()
+        };
+        let sumto = build_m("sumTo", "(I)I");
+        let factorial = build_m("factorial", "(I)J");
+        let fib = build_m("fib", "(I)I");
+        let gcd = build_m("gcd", "(II)I");
+        let collatz = build_m("collatz", "(I)I");
+
+        // (method, a, b, built, result_is_long)
+        let mut cases: Vec<(&str, i32, i32, &BuiltMethod, bool)> = Vec::new();
+        for n in [-5, -1, 0, 1, 2, 3, 5, 10, 100, 1000, 10000, 46340] {
+            cases.push(("sumTo", n, 0, &sumto, false));
+        }
+        for n in [-1, 0, 1, 2, 3, 5, 10, 13, 20, 21, 25, 40] {
+            cases.push(("factorial", n, 0, &factorial, true));
+        }
+        for n in [0, 1, 2, 3, 5, 10, 20, 45, 46, 47, 90, 92] {
+            cases.push(("fib", n, 0, &fib, false));
+        }
+        for (a, b) in [
+            (48, 18),
+            (18, 48),
+            (0, 5),
+            (5, 0),
+            (1_000_000, 48),
+            (-12, 8),
+            (12, -8),
+            (i32::MAX, 1),
+            (i32::MIN, 2),
+            (7, 13),
+            (270, 192),
+            (1, i32::MAX),
+        ] {
+            cases.push(("gcd", a, b, &gcd, false));
+        }
+        for n in [
+            1, 2, 3, 6, 7, 9, 27, 55, 97, 171, 703, 871, 6171, 2000, 50000, 100000,
+        ] {
+            cases.push(("collatz", n, 0, &collatz, false));
+        }
+        // Random gcd pairs (Euclid terminates for every int pair).
+        let mut s: u64 = 0xABCD_1234_5678_9EF1;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s
+        };
+        for _ in 0..120 {
+            cases.push(("gcd", next() as i32, next() as i32, &gcd, false));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, a, b, _, _)| format!("{m} {a} {b}"))
+            .collect();
+        let Some(oracle_results) = run_loops_oracle(&dir, &lines) else {
+            eprintln!("skipping differential_loops: could not run the oracle");
+            return;
+        };
+        assert_eq!(oracle_results.len(), cases.len());
+
+        for ((m, a, b, built, is_long), &expected) in cases.iter().zip(&oracle_results) {
+            let args = if *m == "gcd" {
+                vec![Val128::from_i32(*a), Val128::from_i32(*b)]
+            } else {
+                vec![Val128::from_i32(*a)]
+            };
+            let r = match execute(built, &args) {
+                Ok(v) => v,
+                Err(e) => panic!("{m}({a}, {b}) execute failed: {e:?}"),
+            };
+            let got = if *is_long {
+                r.as_i64()
+            } else {
+                r.as_i32() as i64
+            };
+            assert_eq!(got, expected, "{m}({a}, {b}) diverged from Corretto 21");
+        }
+        eprintln!(
+            "loops differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
     }
 }

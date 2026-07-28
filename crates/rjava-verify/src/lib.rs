@@ -349,6 +349,24 @@ fn apply(
             f.pop_expect(Int, pc)?;
             f.push(Int, max_stack, pc)?;
         } // ineg
+        0x7e => {
+            f.pop_expect(Int, pc)?;
+            f.pop_expect(Int, pc)?;
+            f.push(Int, max_stack, pc)?;
+        } // iand
+        0x84 => {
+            // iinc: local += const; the local must be an int and stays one (no stack effect).
+            let idx = ((ins.arg >> 8) & 0xFF) as u16;
+            if idx as usize >= max_locals as usize {
+                return Err(VerifyError::BadLocal { pc, index: idx });
+            }
+            if f.locals[idx as usize] != Int {
+                return Err(VerifyError::TypeMismatch {
+                    pc,
+                    what: "iinc on non-int local",
+                });
+            }
+        } // iinc
         0x61 | 0x65 | 0x69 => {
             f.pop_expect(Long, pc)?;
             f.pop_expect(Long, pc)?;
@@ -409,6 +427,12 @@ fn apply(
                 return Err(VerifyError::BadReturn(pc));
             }
         } // ireturn
+        0xad => {
+            f.pop_expect(Long, pc)?;
+            if ret != Some(Long) {
+                return Err(VerifyError::BadReturn(pc));
+            }
+        } // lreturn
         _ => return Err(VerifyError::UnsupportedOpcode { op: ins.op, pc }),
     }
     Ok(())

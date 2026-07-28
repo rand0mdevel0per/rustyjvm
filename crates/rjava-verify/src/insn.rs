@@ -64,6 +64,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             | 0x6c
             | 0x70
             | 0x74
+            | 0x7e
             | 0x85
             | 0x86
             | 0x88
@@ -71,7 +72,14 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             | 0x8b
             | 0x8c
             | 0x94..=0x96
-            | 0xac => (0, 1),
+            | 0xac
+            | 0xad => (0, 1),
+            0x84 => {
+                // iinc index, const: pack the u1 index and i1 const into `arg`.
+                let index = u1_at(code, pc + 1)? as i64;
+                let delta = s1_at(code, pc + 2)?;
+                ((index << 8) | ((delta as u8) as i64), 3)
+            }
             0x10 => (s1_at(code, pc + 1)?, 2), // bipush
             0x11 => (s2_at(code, pc + 1)?, 3), // sipush
             0x15..=0x17 => (u1_at(code, pc + 1)? as i64, 2), // iload/lload/fload

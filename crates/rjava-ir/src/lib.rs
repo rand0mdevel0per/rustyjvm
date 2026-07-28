@@ -1,17 +1,20 @@
-//! rjava-ir — L1 SSA construction (RJVM-SPEC-001 §9.2). Converts a verified stack-based method
-//! into a register-based SSA data-flow tree: basic blocks, SSA `Node`s whose `ins` edges ARE the
-//! dependency set that drives out-of-order issue (§10), and `Terminator`s. Increment 1 handles the
-//! vertical-slice opcode set with straight-line-dominated locals (no φ needed yet); general φ
-//! placement for loop/merge variables arrives with loops in increment 2.
+//! rjava-ir — L1 SSA construction (RJVM-SPEC-001 §9.2), now with loop support. SSA is built
+//! directly from bytecode using Braun et al.'s algorithm ("Simple and Efficient Construction of
+//! SSA Form"): per-block variable definitions, sealed blocks, and incomplete phis correctly place
+//! φ nodes at loop headers (back-edges) without a separate dominance pass. Trivial-phi removal is
+//! deferred (redundant φ are correct, just non-minimal). The operand stack is assumed empty at
+//! block boundaries (true for javac's structured control flow); non-empty-stack merges are added
+//! when a fixture needs them.
 //!
-//! The builder trusts its input has passed verification (§7.5) but still returns errors rather than
-//! panicking on anything unexpected (defence in depth).
+//! `Node.ins` edges ARE the dependency set that later drives out-of-order/speculative issue (§10);
+//! building real φ now — rather than keeping locals mutable — keeps that substrate faithful so the
+//! diff/fork machinery (increment 4) is a pure addition.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rjava_classfile::{Constant, ConstantPool};
 use rjava_core::{
-    Block, BlockId, Effect, IntCond, Method, Node, Op, Tag, Terminator, Val128, ValId,
+    Block, BlockId, Effect, IntCond, Method, Node, Op, Phi, Tag, Terminator, Val128, ValId,
 };
 use rjava_verify::{Insn, VerifiedMethod};
 use smallvec::{smallvec, SmallVec};
@@ -20,12 +23,12 @@ use smallvec::{smallvec, SmallVec};
 /// builder never panics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IrError {
-    #[error("opcode {op:#04x} at pc {pc} has no IR lowering (increment-1 subset)")]
+    #[error("opcode {op:#04x} at pc {pc} has no IR lowering (increment-2 subset)")]
     Unsupported { op: u8, pc: u32 },
     #[error("operand stack underflow at pc {0}")]
     StackUnderflow(u32),
-    #[error("read of undefined local {index} at pc {pc}")]
-    BadLocalRead { pc: u32, index: usize },
+    #[error("read of undefined local {index}")]
+    BadLocalRead { index: usize },
     #[error("bad constant reference at pc {0}")]
     BadConstant(u32),
     #[error("control-flow target has no block at pc {0}")]
@@ -43,80 +46,6 @@ pub struct BuiltMethod {
     pub n_slots: usize,
 }
 
-fn fresh(next: &mut u16) -> Result<ValId, IrError> {
-    let id = ValId {
-        scope_level: 0,
-        offset: *next,
-    };
-    *next = next.checked_add(1).ok_or(IrError::TooManyValues)?;
-    Ok(id)
-}
-
-fn push_val(
-    stack: &mut Vec<ValId>,
-    nodes: &mut Vec<Node>,
-    next: &mut u16,
-    op: Op,
-    ins: SmallVec<[ValId; 3]>,
-    ty: Tag,
-    effect: Effect,
-) -> Result<(), IrError> {
-    let id = fresh(next)?;
-    nodes.push(Node {
-        id,
-        op,
-        ins,
-        ty,
-        effect,
-    });
-    stack.push(id);
-    Ok(())
-}
-
-fn binop(
-    stack: &mut Vec<ValId>,
-    nodes: &mut Vec<Node>,
-    next: &mut u16,
-    pc: u32,
-    op: Op,
-    ty: Tag,
-    effect: Effect,
-) -> Result<(), IrError> {
-    let b = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-    let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-    push_val(stack, nodes, next, op, smallvec![a, b], ty, effect)
-}
-
-fn unop(
-    stack: &mut Vec<ValId>,
-    nodes: &mut Vec<Node>,
-    next: &mut u16,
-    pc: u32,
-    op: Op,
-    ty: Tag,
-) -> Result<(), IrError> {
-    let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-    push_val(stack, nodes, next, op, smallvec![a], ty, Effect::Pure)
-}
-
-fn konst(
-    stack: &mut Vec<ValId>,
-    nodes: &mut Vec<Node>,
-    next: &mut u16,
-    val: Val128,
-) -> Result<(), IrError> {
-    let ty = val.tag();
-    push_val(
-        stack,
-        nodes,
-        next,
-        Op::Const(val),
-        smallvec![],
-        ty,
-        Effect::Pure,
-    )
-}
-
 fn cp_const(cp: &ConstantPool, index: i64, pc: u32) -> Result<Val128, IrError> {
     let idx = u16::try_from(index).map_err(|_| IrError::BadConstant(pc))?;
     Ok(match cp.get(idx) {
@@ -128,7 +57,7 @@ fn cp_const(cp: &ConstantPool, index: i64, pc: u32) -> Result<Val128, IrError> {
     })
 }
 
-fn int_cond(op: u8) -> IntCond {
+fn if_cond(op: u8) -> IntCond {
     match op {
         0x99 => IntCond::Eq,
         0x9a => IntCond::Ne,
@@ -139,8 +68,22 @@ fn int_cond(op: u8) -> IntCond {
     }
 }
 
-/// Compute the basic-block leaders: entry, every branch target, and the instruction after every
-/// branch or `ireturn`.
+fn if_icmp_cond(op: u8) -> IntCond {
+    match op {
+        0x9f => IntCond::Eq,
+        0xa0 => IntCond::Ne,
+        0xa1 => IntCond::Lt,
+        0xa2 => IntCond::Ge,
+        0xa3 => IntCond::Gt,
+        _ => IntCond::Le, // 0xa4
+    }
+}
+
+fn is_return(op: u8) -> bool {
+    (0xac..=0xb1).contains(&op)
+}
+
+/// Basic-block leaders: entry, every branch target, and the instruction after every branch/return.
 fn leaders(insns: &[Insn], valid: &HashMap<u32, usize>) -> Vec<u32> {
     let mut set = BTreeSet::new();
     if let Some(first) = insns.first() {
@@ -160,6 +103,431 @@ fn leaders(insns: &[Insn], valid: &HashMap<u32, usize>) -> Vec<u32> {
     set.into_iter().collect()
 }
 
+/// A φ under construction: its owning block, the local it merges, its SSA value, and its operands.
+struct PhiDef {
+    block: BlockId,
+    var: u16,
+    val: ValId,
+    sources: Vec<(BlockId, ValId)>,
+}
+
+/// SSA-construction state (Braun et al.).
+struct Ssa {
+    current_def: HashMap<(u16, BlockId), ValId>,
+    phis: Vec<PhiDef>,
+    phi_of: HashMap<ValId, usize>,
+    incomplete_phis: HashMap<BlockId, Vec<ValId>>,
+    sealed: HashSet<BlockId>,
+    preds: HashMap<BlockId, Vec<BlockId>>,
+    next: u16,
+}
+
+impl Ssa {
+    fn fresh(&mut self) -> Result<ValId, IrError> {
+        let id = ValId {
+            scope_level: 0,
+            offset: self.next,
+        };
+        self.next = self.next.checked_add(1).ok_or(IrError::TooManyValues)?;
+        Ok(id)
+    }
+
+    fn write_variable(&mut self, var: u16, block: BlockId, val: ValId) {
+        self.current_def.insert((var, block), val);
+    }
+
+    fn read_variable(&mut self, var: u16, block: BlockId) -> Result<ValId, IrError> {
+        if let Some(&v) = self.current_def.get(&(var, block)) {
+            return Ok(v);
+        }
+        self.read_variable_recursive(var, block)
+    }
+
+    fn read_variable_recursive(&mut self, var: u16, block: BlockId) -> Result<ValId, IrError> {
+        let val = if !self.sealed.contains(&block) {
+            let phi = self.new_phi(block, var)?;
+            self.incomplete_phis.entry(block).or_default().push(phi);
+            phi
+        } else {
+            let preds = self.preds.get(&block).cloned().unwrap_or_default();
+            match preds.len() {
+                0 => {
+                    return Err(IrError::BadLocalRead {
+                        index: var as usize,
+                    })
+                }
+                1 => self.read_variable(var, preds[0])?,
+                _ => {
+                    let phi = self.new_phi(block, var)?;
+                    self.write_variable(var, block, phi); // break cycles first
+                    self.add_phi_operands(phi)?;
+                    phi
+                }
+            }
+        };
+        self.write_variable(var, block, val);
+        Ok(val)
+    }
+
+    fn new_phi(&mut self, block: BlockId, var: u16) -> Result<ValId, IrError> {
+        let val = self.fresh()?;
+        let idx = self.phis.len();
+        self.phis.push(PhiDef {
+            block,
+            var,
+            val,
+            sources: Vec::new(),
+        });
+        self.phi_of.insert(val, idx);
+        Ok(val)
+    }
+
+    fn add_phi_operands(&mut self, phi_val: ValId) -> Result<(), IrError> {
+        let idx = self.phi_of[&phi_val];
+        let (block, var) = (self.phis[idx].block, self.phis[idx].var);
+        let preds = self.preds.get(&block).cloned().unwrap_or_default();
+        for p in preds {
+            let v = self.read_variable(var, p)?;
+            self.phis[idx].sources.push((p, v));
+        }
+        Ok(())
+    }
+
+    fn seal_block(&mut self, block: BlockId) -> Result<(), IrError> {
+        if let Some(list) = self.incomplete_phis.remove(&block) {
+            for phi in list {
+                self.add_phi_operands(phi)?;
+            }
+        }
+        self.sealed.insert(block);
+        Ok(())
+    }
+
+    // ---- node emission helpers (push onto the current block's node list) ----
+
+    fn emit(
+        &mut self,
+        nodes: &mut Vec<Node>,
+        stack: &mut Vec<ValId>,
+        op: Op,
+        ins: SmallVec<[ValId; 3]>,
+        ty: Tag,
+        effect: Effect,
+    ) -> Result<(), IrError> {
+        let id = self.fresh()?;
+        nodes.push(Node {
+            id,
+            op,
+            ins,
+            ty,
+            effect,
+        });
+        stack.push(id);
+        Ok(())
+    }
+
+    fn binop(
+        &mut self,
+        nodes: &mut Vec<Node>,
+        stack: &mut Vec<ValId>,
+        pc: u32,
+        op: Op,
+        ty: Tag,
+        effect: Effect,
+    ) -> Result<(), IrError> {
+        let b = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+        let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+        self.emit(nodes, stack, op, smallvec![a, b], ty, effect)
+    }
+
+    fn unop(
+        &mut self,
+        nodes: &mut Vec<Node>,
+        stack: &mut Vec<ValId>,
+        pc: u32,
+        op: Op,
+        ty: Tag,
+    ) -> Result<(), IrError> {
+        let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+        self.emit(nodes, stack, op, smallvec![a], ty, Effect::Pure)
+    }
+
+    fn konst(
+        &mut self,
+        nodes: &mut Vec<Node>,
+        stack: &mut Vec<ValId>,
+        val: Val128,
+    ) -> Result<(), IrError> {
+        let ty = val.tag();
+        self.emit(nodes, stack, Op::Const(val), smallvec![], ty, Effect::Pure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_block(
+        &mut self,
+        block: BlockId,
+        insns: &[Insn],
+        cp: &ConstantPool,
+        block_of: &HashMap<u32, BlockId>,
+        nodes: &mut Vec<Node>,
+    ) -> Result<Option<Terminator>, IrError> {
+        let mut stack: Vec<ValId> = Vec::new();
+        let mut term: Option<Terminator> = None;
+        for ins in insns {
+            let pc = ins.pc;
+            match ins.op {
+                0x00 => {}
+                // constants
+                0x02..=0x08 => {
+                    self.konst(nodes, &mut stack, Val128::from_i32(ins.op as i32 - 3))?
+                }
+                0x09..=0x0a => {
+                    self.konst(nodes, &mut stack, Val128::from_i64((ins.op - 0x09) as i64))?
+                }
+                0x0b..=0x0d => {
+                    self.konst(nodes, &mut stack, Val128::from_f32((ins.op - 0x0b) as f32))?
+                }
+                0x10..=0x11 => self.konst(nodes, &mut stack, Val128::from_i32(ins.arg as i32))?,
+                0x12..=0x14 => {
+                    let v = cp_const(cp, ins.arg, pc)?;
+                    self.konst(nodes, &mut stack, v)?;
+                }
+                // loads (read_variable)
+                0x15..=0x17 => {
+                    let v = self.read_variable(ins.arg as u16, block)?;
+                    stack.push(v);
+                }
+                0x1a..=0x1d => {
+                    let v = self.read_variable((ins.op - 0x1a) as u16, block)?;
+                    stack.push(v);
+                }
+                0x1e..=0x21 => {
+                    let v = self.read_variable((ins.op - 0x1e) as u16, block)?;
+                    stack.push(v);
+                }
+                0x22..=0x25 => {
+                    let v = self.read_variable((ins.op - 0x22) as u16, block)?;
+                    stack.push(v);
+                }
+                // stores (write_variable)
+                0x36..=0x38 => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable(ins.arg as u16, block, v);
+                }
+                0x3b..=0x3e => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable((ins.op - 0x3b) as u16, block, v);
+                }
+                0x3f..=0x42 => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable((ins.op - 0x3f) as u16, block, v);
+                }
+                0x43..=0x46 => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable((ins.op - 0x43) as u16, block, v);
+                }
+                // iinc index, const: local += const
+                0x84 => {
+                    let index = ((ins.arg >> 8) & 0xFF) as u16;
+                    let delta = (ins.arg & 0xFF) as u8 as i8 as i32;
+                    let cur = self.read_variable(index, block)?;
+                    let k = self.fresh()?;
+                    nodes.push(Node {
+                        id: k,
+                        op: Op::Const(Val128::from_i32(delta)),
+                        ins: smallvec![],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    let r = self.fresh()?;
+                    nodes.push(Node {
+                        id: r,
+                        op: Op::Add,
+                        ins: smallvec![cur, k],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    self.write_variable(index, block, r);
+                }
+                // integer arithmetic / bitwise
+                0x60 => self.binop(nodes, &mut stack, pc, Op::Add, Tag::I32, Effect::Pure)?,
+                0x64 => self.binop(nodes, &mut stack, pc, Op::Sub, Tag::I32, Effect::Pure)?,
+                0x68 => self.binop(nodes, &mut stack, pc, Op::Mul, Tag::I32, Effect::Pure)?,
+                0x6c => self.binop(
+                    nodes,
+                    &mut stack,
+                    pc,
+                    Op::Div,
+                    Tag::I32,
+                    Effect::MayThrow { caught: false },
+                )?,
+                0x70 => self.binop(
+                    nodes,
+                    &mut stack,
+                    pc,
+                    Op::Rem,
+                    Tag::I32,
+                    Effect::MayThrow { caught: false },
+                )?,
+                0x74 => self.unop(nodes, &mut stack, pc, Op::Neg, Tag::I32)?,
+                0x7e => self.binop(nodes, &mut stack, pc, Op::And, Tag::I32, Effect::Pure)?,
+                // long arithmetic
+                0x61 => self.binop(nodes, &mut stack, pc, Op::Add, Tag::I64, Effect::Pure)?,
+                0x65 => self.binop(nodes, &mut stack, pc, Op::Sub, Tag::I64, Effect::Pure)?,
+                0x69 => self.binop(nodes, &mut stack, pc, Op::Mul, Tag::I64, Effect::Pure)?,
+                // float arithmetic
+                0x62 => self.binop(nodes, &mut stack, pc, Op::Add, Tag::F32, Effect::Pure)?,
+                0x66 => self.binop(nodes, &mut stack, pc, Op::Sub, Tag::F32, Effect::Pure)?,
+                0x6a => self.binop(nodes, &mut stack, pc, Op::Mul, Tag::F32, Effect::Pure)?,
+                // conversions
+                0x85 => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::I64)?,
+                0x86 => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::F32)?,
+                0x88 => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::I32)?,
+                0x89 => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::F32)?,
+                0x8b => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::I32)?,
+                0x8c => self.unop(nodes, &mut stack, pc, Op::Convert, Tag::I64)?,
+                // compares (3-way -> int)
+                0x94..=0x95 => self.binop(
+                    nodes,
+                    &mut stack,
+                    pc,
+                    Op::Cmp { nan_greater: false },
+                    Tag::I32,
+                    Effect::Pure,
+                )?,
+                0x96 => self.binop(
+                    nodes,
+                    &mut stack,
+                    pc,
+                    Op::Cmp { nan_greater: true },
+                    Tag::I32,
+                    Effect::Pure,
+                )?,
+                // branches
+                0x99..=0x9e => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let cond = self.fresh()?;
+                    nodes.push(Node {
+                        id: cond,
+                        op: Op::TestZero(if_cond(ins.op)),
+                        ins: smallvec![v],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    term = Some(cond_branch(cond, ins, block_of, pc)?);
+                }
+                0x9f..=0xa4 => {
+                    let b = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let cond = self.fresh()?;
+                    nodes.push(Node {
+                        id: cond,
+                        op: Op::ICmp(if_icmp_cond(ins.op)),
+                        ins: smallvec![a, b],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    term = Some(cond_branch(cond, ins, block_of, pc)?);
+                }
+                0xa7 => {
+                    let taken = *block_of
+                        .get(&ins.branch_target().unwrap())
+                        .ok_or(IrError::BadBlock(pc))?;
+                    term = Some(Terminator::Goto(taken));
+                }
+                0xac | 0xad => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    term = Some(Terminator::Return(Some(v)));
+                }
+                _ => return Err(IrError::Unsupported { op: ins.op, pc }),
+            }
+        }
+        Ok(term)
+    }
+}
+
+fn cond_branch(
+    cond: ValId,
+    ins: &Insn,
+    block_of: &HashMap<u32, BlockId>,
+    pc: u32,
+) -> Result<Terminator, IrError> {
+    let taken = *block_of
+        .get(&ins.branch_target().unwrap())
+        .ok_or(IrError::BadBlock(pc))?;
+    let not_taken = *block_of
+        .get(&(pc + ins.len as u32))
+        .ok_or(IrError::BadBlock(pc))?;
+    Ok(Terminator::CondBranch {
+        cond,
+        taken,
+        not_taken,
+    })
+}
+
+/// Successors of a block, from its last instruction.
+fn successors(
+    last: Option<&Insn>,
+    bidx: usize,
+    nblocks: usize,
+    block_of: &HashMap<u32, BlockId>,
+) -> Vec<BlockId> {
+    let next = |bidx: usize| -> Vec<BlockId> {
+        if bidx + 1 < nblocks {
+            vec![BlockId((bidx + 1) as u32)]
+        } else {
+            vec![]
+        }
+    };
+    match last {
+        Some(ins) if (0x99..=0xa4).contains(&ins.op) => {
+            let mut s = Vec::new();
+            if let Some(t) = ins.branch_target().and_then(|t| block_of.get(&t)) {
+                s.push(*t);
+            }
+            if let Some(&fb) = block_of.get(&(ins.pc + ins.len as u32)) {
+                s.push(fb);
+            }
+            s
+        }
+        Some(ins) if ins.op == 0xa7 => ins
+            .branch_target()
+            .and_then(|t| block_of.get(&t))
+            .map(|b| vec![*b])
+            .unwrap_or_default(),
+        Some(ins) if is_return(ins.op) => vec![],
+        _ => next(bidx),
+    }
+}
+
+/// Reverse post-order of the reachable blocks from `entry`.
+fn reverse_postorder(
+    entry: BlockId,
+    succs: &HashMap<BlockId, Vec<BlockId>>,
+    n: usize,
+) -> Vec<BlockId> {
+    let mut visited = vec![false; n];
+    let mut post = Vec::new();
+    let mut stack = vec![(entry, 0usize)];
+    visited[entry.0 as usize] = true;
+    while let Some(&(b, i)) = stack.last() {
+        let s = succs.get(&b).map(Vec::as_slice).unwrap_or(&[]);
+        if i < s.len() {
+            stack.last_mut().unwrap().1 += 1;
+            let c = s[i];
+            if !visited[c.0 as usize] {
+                visited[c.0 as usize] = true;
+                stack.push((c, 0));
+            }
+        } else {
+            post.push(b);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    post
+}
+
 /// Build the L1 SSA form of a verified method.
 pub fn build(vm: &VerifiedMethod, cp: &ConstantPool) -> Result<BuiltMethod, IrError> {
     let valid: HashMap<u32, usize> = vm
@@ -169,325 +537,157 @@ pub fn build(vm: &VerifiedMethod, cp: &ConstantPool) -> Result<BuiltMethod, IrEr
         .map(|(i, ins)| (ins.pc, i))
         .collect();
     let leader_pcs = leaders(&vm.insns, &valid);
+    let nblocks = leader_pcs.len();
     let block_of: HashMap<u32, BlockId> = leader_pcs
         .iter()
         .enumerate()
         .map(|(i, &pc)| (pc, BlockId(i as u32)))
         .collect();
 
-    // Partition instructions into blocks (they are already in pc order).
-    let mut block_insns: Vec<Vec<Insn>> = vec![Vec::new(); leader_pcs.len()];
+    // Partition instructions into blocks (already in pc order).
+    let mut block_insns: Vec<Vec<Insn>> = vec![Vec::new(); nblocks];
     let mut bi = 0;
     for ins in &vm.insns {
-        while bi + 1 < leader_pcs.len() && ins.pc >= leader_pcs[bi + 1] {
+        while bi + 1 < nblocks && ins.pc >= leader_pcs[bi + 1] {
             bi += 1;
         }
         block_insns[bi].push(*ins);
     }
 
-    // Bind arguments to SSA values and seed the locals map.
-    let mut next: u16 = 0;
-    let mut locals: Vec<Option<ValId>> = vec![None; vm.max_locals as usize];
+    // CFG edges.
+    let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for (idx, insns) in block_insns.iter().enumerate() {
+        let s = successors(insns.last(), idx, nblocks, &block_of);
+        for &t in &s {
+            preds.entry(t).or_default().push(BlockId(idx as u32));
+        }
+        succs.insert(BlockId(idx as u32), s);
+    }
+
+    // If the very first block is itself a loop header (has a back-edge), insert a synthetic entry
+    // block that merely jumps to it, so the real first block gains a non-back-edge predecessor and
+    // its loop-carried locals get proper φ (otherwise arguments bound at the entry would shadow the
+    // φ and the loop would never observe updated values — e.g. a tight `while` at pc 0).
+    let needs_synth = preds.get(&BlockId(0)).is_some_and(|p| !p.is_empty());
+    let total = if needs_synth { nblocks + 1 } else { nblocks };
+    let entry = if needs_synth {
+        let synth = BlockId(nblocks as u32);
+        succs.insert(synth, vec![BlockId(0)]);
+        preds.entry(BlockId(0)).or_default().push(synth);
+        synth
+    } else {
+        BlockId(0)
+    };
+    let order = reverse_postorder(entry, &succs, total);
+
+    let mut ssa = Ssa {
+        current_def: HashMap::new(),
+        phis: Vec::new(),
+        phi_of: HashMap::new(),
+        incomplete_phis: HashMap::new(),
+        sealed: HashSet::new(),
+        preds,
+        next: 0,
+    };
+
+    // Entry has no predecessors: seal it, then bind arguments.
+    ssa.seal_block(entry)?;
     let mut arg_vals = Vec::new();
     {
-        let mut slot = 0usize;
+        let mut slot = 0u16;
         if !vm.is_static {
-            let v = fresh(&mut next)?;
-            locals[slot] = Some(v);
+            let v = ssa.fresh()?;
+            ssa.write_variable(slot, entry, v);
             arg_vals.push(v);
             slot += 1;
         }
         for &t in &vm.arg_types {
-            let v = fresh(&mut next)?;
-            *locals.get_mut(slot).ok_or(IrError::BadBlock(0))? = Some(v);
+            let v = ssa.fresh()?;
+            ssa.write_variable(slot, entry, v);
             arg_vals.push(v);
-            slot += t.size() as usize;
+            slot += t.size();
         }
     }
 
-    let mut blocks: Vec<Block> = Vec::with_capacity(leader_pcs.len());
-    for (bidx, block) in block_insns.iter().enumerate() {
-        let mut stack: Vec<ValId> = Vec::new(); // verified empty at every block boundary
-        let mut nodes: Vec<Node> = Vec::new();
-        let mut term: Option<Terminator> = None;
+    // Process blocks in RPO, sealing each as soon as all its predecessors are processed.
+    let mut nodes_of: Vec<Vec<Node>> = (0..total).map(|_| Vec::new()).collect();
+    let mut term_of: Vec<Option<Terminator>> = (0..total).map(|_| None).collect();
+    let mut processed: HashSet<BlockId> = HashSet::new();
+    let all_processed = |b: BlockId, ssa: &Ssa, processed: &HashSet<BlockId>| {
+        ssa.preds
+            .get(&b)
+            .is_none_or(|ps| ps.iter().all(|p| processed.contains(p)))
+    };
 
-        for ins in block {
-            let pc = ins.pc;
-            match ins.op {
-                0x00 => {}
-                // constants
-                0x02..=0x08 => konst(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    Val128::from_i32(ins.op as i32 - 3),
-                )?,
-                0x09 | 0x0a => konst(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    Val128::from_i64((ins.op - 0x09) as i64),
-                )?,
-                0x0b..=0x0d => konst(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    Val128::from_f32((ins.op - 0x0b) as f32),
-                )?,
-                0x10 | 0x11 => konst(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    Val128::from_i32(ins.arg as i32),
-                )?,
-                0x12..=0x14 => {
-                    let v = cp_const(cp, ins.arg, pc)?;
-                    konst(&mut stack, &mut nodes, &mut next, v)?;
-                }
-                // loads
-                0x15..=0x17 => load(&mut stack, &locals, ins.arg as usize, pc)?,
-                0x1a..=0x1d => load(&mut stack, &locals, (ins.op - 0x1a) as usize, pc)?,
-                0x1e..=0x21 => load(&mut stack, &locals, (ins.op - 0x1e) as usize, pc)?,
-                0x22..=0x25 => load(&mut stack, &locals, (ins.op - 0x22) as usize, pc)?,
-                // stores
-                0x36..=0x38 => store(&mut stack, &mut locals, ins.arg as usize, pc)?,
-                0x3b..=0x3e => store(&mut stack, &mut locals, (ins.op - 0x3b) as usize, pc)?,
-                0x3f..=0x42 => store(&mut stack, &mut locals, (ins.op - 0x3f) as usize, pc)?,
-                0x43..=0x46 => store(&mut stack, &mut locals, (ins.op - 0x43) as usize, pc)?,
-                // integer arithmetic
-                0x60 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Add,
-                    Tag::I32,
-                    Effect::Pure,
-                )?,
-                0x64 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Sub,
-                    Tag::I32,
-                    Effect::Pure,
-                )?,
-                0x68 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Mul,
-                    Tag::I32,
-                    Effect::Pure,
-                )?,
-                0x6c => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Div,
-                    Tag::I32,
-                    Effect::MayThrow { caught: false },
-                )?,
-                0x70 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Rem,
-                    Tag::I32,
-                    Effect::MayThrow { caught: false },
-                )?,
-                0x74 => unop(&mut stack, &mut nodes, &mut next, pc, Op::Neg, Tag::I32)?,
-                // long arithmetic
-                0x61 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Add,
-                    Tag::I64,
-                    Effect::Pure,
-                )?,
-                0x65 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Sub,
-                    Tag::I64,
-                    Effect::Pure,
-                )?,
-                0x69 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Mul,
-                    Tag::I64,
-                    Effect::Pure,
-                )?,
-                // float arithmetic
-                0x62 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Add,
-                    Tag::F32,
-                    Effect::Pure,
-                )?,
-                0x66 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Sub,
-                    Tag::F32,
-                    Effect::Pure,
-                )?,
-                0x6a => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Mul,
-                    Tag::F32,
-                    Effect::Pure,
-                )?,
-                // conversions (result type from the opcode)
-                0x85 => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::I64)?, // i2l
-                0x86 => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::F32)?, // i2f
-                0x88 => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::I32)?, // l2i
-                0x89 => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::F32)?, // l2f
-                0x8b => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::I32)?, // f2i
-                0x8c => unop(&mut stack, &mut nodes, &mut next, pc, Op::Convert, Tag::I64)?, // f2l
-                // compares (3-way -> int)
-                0x94 | 0x95 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Cmp { nan_greater: false },
-                    Tag::I32,
-                    Effect::Pure,
-                )?,
-                0x96 => binop(
-                    &mut stack,
-                    &mut nodes,
-                    &mut next,
-                    pc,
-                    Op::Cmp { nan_greater: true },
-                    Tag::I32,
-                    Effect::Pure,
-                )?,
-                // branches
-                0x99..=0x9e => {
-                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-                    let cond = fresh(&mut next)?;
-                    nodes.push(Node {
-                        id: cond,
-                        op: Op::TestZero(int_cond(ins.op)),
-                        ins: smallvec![v],
-                        ty: Tag::I32,
-                        effect: Effect::Pure,
-                    });
-                    let taken = *block_of
-                        .get(&ins.branch_target().unwrap())
-                        .ok_or(IrError::BadBlock(pc))?;
-                    let not_taken = *block_of
-                        .get(&(pc + ins.len as u32))
-                        .ok_or(IrError::BadBlock(pc))?;
-                    term = Some(Terminator::CondBranch {
-                        cond,
-                        taken,
-                        not_taken,
-                    });
-                }
-                0xa7 => {
-                    let taken = *block_of
-                        .get(&ins.branch_target().unwrap())
-                        .ok_or(IrError::BadBlock(pc))?;
-                    term = Some(Terminator::Goto(taken));
-                }
-                0xac => {
-                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-                    term = Some(Terminator::Return(Some(v)));
-                }
-                _ => return Err(IrError::Unsupported { op: ins.op, pc }),
-            }
+    for &b in &order {
+        if !ssa.sealed.contains(&b) && all_processed(b, &ssa, &processed) {
+            ssa.seal_block(b)?;
         }
+        let bidx = b.0 as usize;
+        if bidx < nblocks {
+            let mut nodes = Vec::new();
+            let term = ssa.process_block(b, &block_insns[bidx], cp, &block_of, &mut nodes)?;
+            nodes_of[bidx] = nodes;
+            term_of[bidx] = Some(term.unwrap_or_else(|| {
+                // Fall-through into the next block in pc order.
+                Terminator::Goto(BlockId((bidx + 1).min(nblocks.saturating_sub(1)) as u32))
+            }));
+        } else {
+            // Synthetic entry block: jump to the real first block.
+            term_of[bidx] = Some(Terminator::Goto(BlockId(0)));
+        }
+        processed.insert(b);
+        // Seal any block whose predecessors are now all processed (e.g. a loop header after its
+        // back-edge block has been processed).
+        let to_seal: Vec<BlockId> = order
+            .iter()
+            .copied()
+            .filter(|&hb| !ssa.sealed.contains(&hb) && all_processed(hb, &ssa, &processed))
+            .collect();
+        for hb in to_seal {
+            ssa.seal_block(hb)?;
+        }
+    }
 
-        let terminator = match term {
-            Some(t) => t,
-            None => {
-                // Fall through to the next block.
-                let next_block = bidx + 1;
-                if next_block < leader_pcs.len() {
-                    Terminator::Goto(BlockId(next_block as u32))
-                } else {
-                    return Err(IrError::BadBlock(block.last().map_or(0, |i| i.pc)));
-                }
-            }
-        };
+    // Group φ definitions by block.
+    let mut phis_of: Vec<Vec<Phi>> = (0..total).map(|_| Vec::new()).collect();
+    for pd in &ssa.phis {
+        phis_of[pd.block.0 as usize].push(Phi {
+            slot: pd.val,
+            sources: pd.sources.iter().copied().collect(),
+        });
+    }
 
+    let mut blocks = Vec::with_capacity(total);
+    for idx in 0..total {
         blocks.push(Block {
-            id: BlockId(bidx as u32),
-            phis: Vec::new(),
-            nodes,
-            term: terminator,
+            id: BlockId(idx as u32),
+            phis: std::mem::take(&mut phis_of[idx]),
+            nodes: std::mem::take(&mut nodes_of[idx]),
+            term: term_of[idx].take().unwrap_or(Terminator::Return(None)),
         });
     }
 
     Ok(BuiltMethod {
         method: Method {
             blocks,
-            entry: BlockId(0),
+            entry,
             max_locals: vm.max_locals,
             exc_table: Vec::new(),
         },
         arg_vals,
-        n_slots: next as usize,
+        n_slots: ssa.next as usize,
     })
-}
-
-fn load(
-    stack: &mut Vec<ValId>,
-    locals: &[Option<ValId>],
-    idx: usize,
-    pc: u32,
-) -> Result<(), IrError> {
-    let v = locals
-        .get(idx)
-        .copied()
-        .flatten()
-        .ok_or(IrError::BadLocalRead { pc, index: idx })?;
-    stack.push(v);
-    Ok(())
-}
-
-fn store(
-    stack: &mut Vec<ValId>,
-    locals: &mut [Option<ValId>],
-    idx: usize,
-    pc: u32,
-) -> Result<(), IrError> {
-    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-    *locals
-        .get_mut(idx)
-        .ok_or(IrError::BadLocalRead { pc, index: idx })? = Some(v);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn compile_slice() -> Option<Vec<u8>> {
-        let src =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Slice.java");
+    fn compile(name: &str) -> Option<Vec<u8>> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../testdata/java/{name}.java"));
         if !src.exists() {
             return None;
         }
@@ -503,39 +703,25 @@ mod tests {
         if !ok {
             return None;
         }
-        std::fs::read(out.join("Slice.class")).ok()
+        std::fs::read(out.join(format!("{name}.class"))).ok()
     }
 
     #[test]
-    fn builds_slice_arith_ssa() {
-        let Some(bytes) = compile_slice() else {
-            eprintln!("skipping builds_slice_arith_ssa: javac unavailable");
+    fn builds_loop_with_phi() {
+        let Some(bytes) = compile("Loops") else {
+            eprintln!("skipping builds_loop_with_phi: javac unavailable");
             return;
         };
         let cf = rjava_classfile::parse(&bytes).unwrap();
-        let arith = cf.method("arith", "(IIJF)I").unwrap();
-        let vm = rjava_verify::verify_method(&cf, arith).unwrap();
+        let m = cf.method("sumTo", "(I)I").unwrap();
+        let vm = rjava_verify::verify_method(&cf, m).unwrap();
         let built = build(&vm, &cf.constant_pool).unwrap();
-
-        assert_eq!(built.arg_vals.len(), 4); // a, b, c, d
-        assert_eq!(built.method.blocks.len(), 6); // leaders 0,44,52,63,70,76
-        assert_eq!(built.method.entry, BlockId(0));
-        // Every block ends in a real terminator; the entry block ends in a conditional branch.
-        assert!(matches!(
-            built.method.blocks[0].term,
-            Terminator::CondBranch { .. }
-        ));
-        // Some block returns a value.
-        assert!(built
-            .method
-            .blocks
-            .iter()
-            .any(|b| matches!(b.term, Terminator::Return(Some(_)))));
-        // SSA offsets are dense and within n_slots.
-        for b in &built.method.blocks {
-            for n in &b.nodes {
-                assert!((n.id.offset as usize) < built.n_slots);
-            }
-        }
+        // The loop header must carry φ nodes for the loop-carried locals (s, i).
+        let total_phis: usize = built.method.blocks.iter().map(|b| b.phis.len()).sum();
+        assert!(
+            total_phis >= 2,
+            "loop header should have φ for s and i, got {total_phis}"
+        );
+        assert_eq!(built.arg_vals.len(), 1); // n
     }
 }
