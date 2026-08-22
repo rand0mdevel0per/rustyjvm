@@ -134,7 +134,12 @@ impl ConstantPool {
             entries.push(c);
             i += 1;
             if wide {
-                // Long/Double occupy two entries; the next index is unusable (JVMS §4.4.5).
+                // Long/Double occupy two entries; the next index is unusable (JVMS §4.4.5). A wide
+                // entry in the final slot would run past `constant_pool_count`, which makes the
+                // class malformed — reject rather than silently over-filling the pool.
+                if i >= count {
+                    return Err(ClassFileError::BadCpIndex(i));
+                }
                 entries.push(Constant::Unusable);
                 i += 1;
             }
@@ -245,6 +250,33 @@ fn decode_mutf8(bytes: &[u8]) -> Result<String, ClassFileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_wide_constant_in_the_final_slot() {
+        // Regression for a review finding: a Long/Double occupying the last declared slot runs past
+        // `constant_pool_count` (JVMS §4.4.5 makes the class malformed) and would also break the
+        // documented `len() == constant_pool_count`.
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u16.to_be_bytes()); // constant_pool_count = 2 → exactly one entry
+        b.push(5); // CONSTANT_Long
+        b.extend_from_slice(&7i64.to_be_bytes()); // ...which needs two slots — overrun
+        let mut r = Reader::new(&b);
+        assert!(matches!(
+            ConstantPool::parse(&mut r),
+            Err(ClassFileError::BadCpIndex(_))
+        ));
+
+        // With room for both slots it parses, and `len()` equals the declared count.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&3u16.to_be_bytes()); // count = 3 → entry 1 (wide) + sentinel 2
+        ok.push(5);
+        ok.extend_from_slice(&7i64.to_be_bytes());
+        let mut r = Reader::new(&ok);
+        let cp = ConstantPool::parse(&mut r).expect("well-formed wide entry parses");
+        assert_eq!(cp.len(), 3);
+        assert_eq!(cp.get(1), Some(&Constant::Long(7)));
+        assert_eq!(cp.get(2), Some(&Constant::Unusable));
+    }
 
     #[test]
     fn mutf8_ascii_and_two_byte_nul() {

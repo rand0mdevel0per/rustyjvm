@@ -1,3 +1,5 @@
 # `cargo benchmark-test` runs the RustyJVM micro-benchmarks (release) via xtask.
+# `cargo xtask <cmd>` is the general driver entry point.
 [alias]
+xtask = "run --release --package xtask --"
 benchmark-test = "run --release --package xtask -- bench"
