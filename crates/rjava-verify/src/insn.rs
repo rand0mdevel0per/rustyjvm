@@ -91,8 +91,8 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             0x36..=0x38 | 0x3a => (u1_at(code, pc + 1)? as i64, 2), // istore/lstore/fstore/astore
             0x12 => (u1_at(code, pc + 1)? as i64, 2), // ldc
             0x13 | 0x14 => (u2_at(code, pc + 1)?, 3), // ldc_w / ldc2_w
-            // invokestatic / invokespecial / new / getfield / putfield (cp index)
-            0xb8 | 0xb7 | 0xbb | 0xb4 | 0xb5 => (u2_at(code, pc + 1)?, 3),
+            // invoke* / new / field access / instanceof / checkcast (cp index)
+            0xb2..=0xb8 | 0xbb | 0xc0 | 0xc1 => (u2_at(code, pc + 1)?, 3),
             0x99..=0xa4 | 0xa7 | 0xc6 | 0xc7 => (pc as i64 + s2_at(code, pc + 1)?, 3), // branches
             _ => return Err(VerifyError::UnsupportedOpcode { op, pc: pc as u32 }),
         };

@@ -78,25 +78,37 @@ pub enum Op {
     /// Bitwise AND (typed by [`Node::ty`]: int or long). Other bitwise/shift ops are added on
     /// demand in later increments.
     And,
-    /// `invokestatic` of a same-class static method, identified by its index in the class's method
-    /// table. Its `ins` are the argument values in order; `ty` is the return type (ignored for
-    /// `void`). Cross-class dispatch arrives with the loader (increment 6).
+    // ---- symbolic references (§8.3) ----
+    // These carry a *constant-pool index*, not a resolved target: class identity, field layout and
+    // dispatch are runtime-determined and must not be baked at build time (P-3, §8.3, §13.4). The
+    // interpreter resolves them through the class registry at first use.
+    /// `invokestatic`. `ins` are the arguments in order; `ty` is the return type (unused for `void`).
     InvokeStatic(u16),
-    /// Allocate a fresh object of the current class with `n_fields` null-initialised fields
-    /// (§4, §5). `escape` is the escape-analysis classification. `ins` is empty — allocation has no
-    /// prerequisite dependencies (§22.1).
-    New {
-        escape: EscapeState,
-        n_fields: u16,
-    },
-    /// Read instance field `index` of the object in `ins[0]` (§8); `ty` is the field type.
-    GetField(u16),
-    /// Write `ins[1]` into instance field `index` of the object in `ins[0]`.
-    PutField(u16),
-    /// `invokespecial` of a same-class instance method (`<init>`) by method index; `ins` is
-    /// `[this, args...]`. Cross-class `invokespecial` (e.g. `Object.<init>`) is a no-op handled in
-    /// the IR (the receiver is simply consumed).
+    /// `invokespecial` — a constructor or other non-virtual instance call. `ins` is `[this, args…]`.
     InvokeSpecial(u16),
+    /// `invokevirtual` — dispatched on the *runtime* class of `ins[0]` through the mutable dispatch
+    /// table (§13.4), never on the statically named class.
+    InvokeVirtual(u16),
+    /// Allocate an instance of the class named by the constant-pool entry. `escape` is the
+    /// escape-analysis classification (§9.4); `ins` is empty — allocation has no prerequisite
+    /// dependencies (§22.1).
+    New {
+        class_cp: u16,
+        escape: EscapeState,
+    },
+    /// Read the instance field named by the constant-pool entry from `ins[0]`; `ty` is its type.
+    GetField(u16),
+    /// Write `ins[1]` into the instance field named by the constant-pool entry of `ins[0]`.
+    PutField(u16),
+    /// Read a static field; triggers initialisation of its declaring class (§8.5).
+    GetStatic(u16),
+    /// Write `ins[0]` to a static field; triggers initialisation of its declaring class (§8.5).
+    PutStatic(u16),
+    /// `instanceof`: 1 if `ins[0]` is a non-null instance of the named class, else 0.
+    InstanceOf(u16),
+    /// `checkcast`: passes `ins[0]` through, raising `ClassCastException` if it is not an instance
+    /// of the named class (increment 8 turns that into a real Java exception).
+    CheckCast(u16),
 }
 
 /// An SSA node: a single value definition (§9.2).

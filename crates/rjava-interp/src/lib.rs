@@ -15,6 +15,7 @@ use rjava_core::{
 };
 use rjava_gc::Heap;
 use rjava_ir::BuiltMethod;
+use rjava_loader::{ClassRegistry, InitState, Resolved};
 
 /// A runtime failure. Increment 1 cannot yet raise Java exceptions (those arrive in increment 8);
 /// conditions like division by zero surface as errors here for now.
@@ -44,6 +45,12 @@ pub enum ExecError {
     OutOfMemory,
     #[error("null pointer (NullPointerException, implemented in increment 8)")]
     NullPointer,
+    #[error("a symbolic reference could not be resolved (NoClassDefFoundError)")]
+    Unresolved,
+    #[error("class initialisation failed (NoClassDefFoundError)")]
+    ClassInitFailed,
+    #[error("bad cast (ClassCastException, implemented in increment 8)")]
+    ClassCast,
 }
 
 /// Default guest call-stack limit, in frames.
@@ -60,61 +67,50 @@ pub enum ExecError {
 /// interpreter), which increment 8 needs anyway for stack traces (§20.7).
 pub const DEFAULT_MAX_CALL_DEPTH: usize = 256;
 
-/// A built class: every static method built once (unbuildable ones → `None`), plus a name→index
-/// map. `invokestatic` resolves against this table and recurses into the callee. Cross-class
-/// dispatch (via the loader, §8) arrives in increment 6.
+/// A loaded program: a class registry plus the entry class used by the name-based helpers.
+///
+/// Symbolic references in the IR are resolved against this registry at execution time (§8.3), and
+/// virtual calls read the *receiver's* dispatch table (§13.4), so nothing about class identity or
+/// dispatch is fixed at build time.
 pub struct Program {
-    methods: Vec<Option<BuiltMethod>>,
-    by_name: std::collections::HashMap<(String, String), u16>,
-    /// Type-appropriate zero values for this class's instance fields, in declaration order (JVMS
-    /// default-value semantics: int→0, long→0L, float→0.0, double→0.0, reference→null).
-    field_defaults: Vec<Val128>,
-    /// Guest call-stack limit for this program (see [`DEFAULT_MAX_CALL_DEPTH`]).
+    registry: ClassRegistry,
+    entry: ClassId,
+    /// Guest call-stack limit (see [`DEFAULT_MAX_CALL_DEPTH`]).
     max_call_depth: usize,
 }
 
-/// The JVMS default value for a field of the given descriptor.
-fn field_default(desc: Option<&str>) -> Val128 {
-    match desc.and_then(|d| d.as_bytes().first()) {
-        Some(b'J') => Val128::from_i64(0),
-        Some(b'F') => Val128::from_f32(0.0),
-        Some(b'D') => Val128::from_f64(0.0),
-        Some(b'L') | Some(b'[') => Val128::null(),
-        _ => Val128::from_i32(0), // B, C, I, S, Z
-    }
-}
-
 impl Program {
-    /// Verify + build every method of a class.
+    /// Build a single-class program (the increment 1–5 entry point).
     pub fn from_class(cf: &rjava_classfile::ClassFile) -> Program {
-        let mut by_name = std::collections::HashMap::new();
-        let methods = cf
-            .methods
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                if let (Some(n), Some(d)) =
-                    (m.name(&cf.constant_pool), m.descriptor(&cf.constant_pool))
-                {
-                    by_name.insert((n.to_string(), d.to_string()), i as u16);
-                }
-                rjava_verify::verify_method(cf, m)
-                    .ok()
-                    .and_then(|vm| rjava_ir::build(&vm, cf).ok())
-            })
-            .collect();
-        let field_defaults = cf
-            .fields
-            .iter()
-            .filter(|m| m.access_flags & 0x0008 == 0) // instance (non-static) fields
-            .map(|m| field_default(m.descriptor(&cf.constant_pool)))
-            .collect();
+        let mut registry = ClassRegistry::new();
+        let entry = registry.link_class(cf.clone());
         Program {
-            methods,
-            by_name,
-            field_defaults,
+            entry,
+            registry,
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
         }
+    }
+
+    /// Load and link every class in a classpath directory, with `entry_class` as the default class
+    /// for the name-based helpers.
+    pub fn from_classpath(
+        dir: &std::path::Path,
+        entry_class: &str,
+    ) -> Result<Program, rjava_loader::LoaderError> {
+        let mut registry = ClassRegistry::new();
+        registry.load_dir(dir)?;
+        let entry = registry
+            .by_name(entry_class)
+            .ok_or_else(|| rjava_loader::LoaderError::NotFound(entry_class.to_string()))?;
+        Ok(Program {
+            registry,
+            entry,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
+        })
+    }
+
+    pub fn registry(&self) -> &ClassRegistry {
+        &self.registry
     }
 
     /// Raise (or lower) the guest call-stack limit — only sound if guest code runs on a host thread
@@ -124,21 +120,24 @@ impl Program {
         self
     }
 
-    /// Invoke a method by its class-table index; `None` = a `void` return.
+    /// Invoke a method of `class` by its index in that class's method table.
     pub fn call(
         &self,
+        class: ClassId,
         index: u16,
         args: &[Val128],
         depth: usize,
         heap: &mut Heap,
     ) -> Result<Option<Val128>, ExecError> {
         let built = self
-            .methods
-            .get(index as usize)
+            .registry
+            .get(class)
+            .and_then(|k| k.methods.get(index as usize))
             .and_then(Option::as_ref)
             .ok_or(ExecError::NoMethod)?;
         run(
-            Some(self),
+            self,
+            class,
             built,
             args,
             depth,
@@ -147,33 +146,55 @@ impl Program {
         )
     }
 
-    /// The class-table index of a method, by name and descriptor.
+    /// The entry class's index for a method, by name and descriptor.
     pub fn method_index(&self, name: &str, desc: &str) -> Option<u16> {
-        self.by_name
-            .get(&(name.to_string(), desc.to_string()))
-            .copied()
+        self.registry.get(self.entry)?.method_index(name, desc)
     }
 
-    /// Invoke a method by name + descriptor (the launcher/test entry point).
+    /// Invoke a method of the entry class by name + descriptor (the launcher/test entry point).
     pub fn call_named(
         &self,
         name: &str,
         desc: &str,
         args: &[Val128],
     ) -> Result<Option<Val128>, ExecError> {
-        let idx = *self
-            .by_name
-            .get(&(name.to_string(), desc.to_string()))
-            .ok_or(ExecError::NoMethod)?;
+        let idx = self.method_index(name, desc).ok_or(ExecError::NoMethod)?;
         let mut heap = Heap::new();
-        self.call(idx, args, 0, &mut heap)
+        self.call(self.entry, idx, args, 0, &mut heap)
     }
-}
 
-/// Execute a call-free built method (increment 1/2a entry point).
-pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError> {
-    let mut heap = Heap::new();
-    run(None, built, args, 0, LogicalFrame(0), &mut heap)?.ok_or(ExecError::BadValue)
+    /// Run `<clinit>` if this class has not been initialised yet (§8.5, JVMS §5.5).
+    ///
+    /// Superclasses initialise first; a vt already running this class's `<clinit>` passes straight
+    /// through instead of deadlocking; and a `<clinit>` that throws marks the class `Failed` so
+    /// later uses raise `NoClassDefFoundError` rather than silently seeing half-set statics.
+    fn ensure_init(&self, class: ClassId, depth: usize, heap: &mut Heap) -> Result<(), ExecError> {
+        let Some(k) = self.registry.get(class) else {
+            return Err(ExecError::NoMethod);
+        };
+        match k.init_state() {
+            InitState::Initialized => return Ok(()),
+            InitState::Failed => return Err(ExecError::ClassInitFailed),
+            // Same vt re-entering its own <clinit>: JVMS §5.5 pass-through.
+            InitState::Initializing(_) => return Ok(()),
+            InitState::Loaded => {}
+        }
+        k.set_init_state(InitState::Initializing(0));
+        if let Some(sup) = k.super_id {
+            self.ensure_init(sup, depth, heap)?;
+        }
+        if let Some(idx) = k.method_index("<clinit>", "()V") {
+            match self.call(class, idx, &[], depth + 1, heap) {
+                Ok(_) => {}
+                Err(e) => {
+                    k.set_init_state(InitState::Failed);
+                    return Err(e);
+                }
+            }
+        }
+        k.set_init_state(InitState::Initialized);
+        Ok(())
+    }
 }
 
 /// Land a chain: apply its recorded reference-count deltas to the heap in program order, then
@@ -231,16 +252,17 @@ fn leave_frame(
 /// Execute a built method over a fresh Env register file. `program` is needed only if the method
 /// contains `invokestatic`; `depth`/`logical` thread the call stack (StackOverflow seam + logical
 /// frames, §20.7).
+#[allow(clippy::too_many_arguments)]
 fn run(
-    program: Option<&Program>,
+    program: &Program,
+    owner: ClassId,
     built: &BuiltMethod,
     args: &[Val128],
     depth: usize,
     logical: LogicalFrame,
     heap: &mut Heap,
 ) -> Result<Option<Val128>, ExecError> {
-    let limit = program.map_or(DEFAULT_MAX_CALL_DEPTH, |p| p.max_call_depth);
-    if depth > limit {
+    if depth > program.max_call_depth {
         return Err(ExecError::StackOverflow);
     }
     if args.len() != built.arg_vals.len() {
@@ -295,26 +317,76 @@ fn run(
             }
             match node.op {
                 // Calls (need the Program + recursion + shared heap).
-                Op::InvokeStatic(index) | Op::InvokeSpecial(index) => {
-                    let prog = program.ok_or(ExecError::UnsupportedOp)?;
+                // ---- calls: symbolic targets resolved through the registry (§8.3) ----
+                Op::InvokeStatic(cp) | Op::InvokeSpecial(cp) | Op::InvokeVirtual(cp) => {
                     let mut argv: smallvec::SmallVec<[Val128; 4]> = smallvec::SmallVec::new();
                     for v in &node.ins {
                         argv.push(env.read_slot(SlotId(v.offset)));
                     }
-                    if let Some(r) = prog.call(index, &argv, depth + 1, heap)? {
-                        env.write_slot(SlotId(node.id.offset), r);
-                        // The callee handed over an in-transit reference; now that a slot of ours
-                        // owns it, drop that extra reference (both deltas land together).
-                        if r.tag().is_ref() {
-                            env.record_ref_delta(r.ref_index(), -1);
+                    let target = match node.op {
+                        Op::InvokeVirtual(_) => {
+                            // Dispatch on the RECEIVER's runtime class, through its dispatch table
+                            // (§13.4) — never on the class named at the call site.
+                            let recv = *argv.first().ok_or(ExecError::BadValue)?;
+                            if recv.tag() == Tag::Null {
+                                return Err(ExecError::NullPointer);
+                            }
+                            let Resolved::VirtualSlot { slot } = program
+                                .registry
+                                .resolve_virtual(owner, cp)
+                                .ok_or(ExecError::Unresolved)?
+                            else {
+                                return Err(ExecError::Unresolved);
+                            };
+                            let rc = heap.get(recv.ref_index()).ok_or(ExecError::BadValue)?.class;
+                            let entry = *program
+                                .registry
+                                .get(rc)
+                                .and_then(|k| k.vtable.get(slot))
+                                .ok_or(ExecError::Unresolved)?;
+                            Some((entry.class, entry.method))
+                        }
+                        _ => match program
+                            .registry
+                            .resolve_method(owner, cp)
+                            .ok_or(ExecError::Unresolved)?
+                        {
+                            Resolved::Method { class, method } => Some((class, method)),
+                            // Object.<init> — the one absent target with no observable effect.
+                            Resolved::NoOp => None,
+                            _ => return Err(ExecError::Unresolved),
+                        },
+                    };
+                    if let Some((cls, midx)) = target {
+                        // A static call is an active use of its class (§8.5).
+                        if matches!(node.op, Op::InvokeStatic(_)) {
+                            program.ensure_init(cls, depth, heap)?;
+                        }
+                        if let Some(r) = program.call(cls, midx, &argv, depth + 1, heap)? {
+                            env.write_slot(SlotId(node.id.offset), r);
+                            // The callee handed over an in-transit reference; now that a slot of
+                            // ours owns it, drop that extra reference (both deltas land together).
+                            if r.tag().is_ref() {
+                                env.record_ref_delta(r.ref_index(), -1);
+                            }
                         }
                     }
                 }
-                // Heap operations.
-                Op::New { escape, .. } => {
-                    let prog = program.ok_or(ExecError::UnsupportedOp)?;
+                // ---- heap ----
+                Op::New { class_cp, escape } => {
+                    let cls = program
+                        .registry
+                        .resolve_class(owner, class_cp)
+                        .ok_or(ExecError::Unresolved)?;
+                    program.ensure_init(cls, depth, heap)?;
+                    let defaults = program
+                        .registry
+                        .get(cls)
+                        .ok_or(ExecError::Unresolved)?
+                        .field_defaults
+                        .clone();
                     let r = heap
-                        .alloc(ClassId(0), escape, prog.field_defaults.clone())
+                        .alloc(cls, escape, defaults)
                         .ok_or(ExecError::OutOfMemory)?;
                     let v = if escape == EscapeState::S1 {
                         Val128::handle(r)
@@ -323,18 +395,25 @@ fn run(
                     };
                     env.write_slot(SlotId(node.id.offset), v);
                 }
-                Op::GetField(idx) => {
+                Op::GetField(cp) => {
                     let obj =
                         env.read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
                     if obj.tag() == Tag::Null {
                         return Err(ExecError::NullPointer);
                     }
+                    let Resolved::InstanceField { slot, .. } = program
+                        .registry
+                        .resolve_field(owner, cp)
+                        .ok_or(ExecError::Unresolved)?
+                    else {
+                        return Err(ExecError::Unresolved);
+                    };
                     let v = heap
-                        .get_field(obj.ref_index(), idx as usize)
+                        .get_field(obj.ref_index(), slot as usize)
                         .ok_or(ExecError::BadValue)?;
                     env.write_slot(SlotId(node.id.offset), v);
                 }
-                Op::PutField(idx) => {
+                Op::PutField(cp) => {
                     let obj =
                         env.read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
                     let val =
@@ -342,12 +421,19 @@ fn run(
                     if obj.tag() == Tag::Null {
                         return Err(ExecError::NullPointer);
                     }
+                    let Resolved::InstanceField { slot, .. } = program
+                        .registry
+                        .resolve_field(owner, cp)
+                        .ok_or(ExecError::Unresolved)?
+                    else {
+                        return Err(ExecError::Unresolved);
+                    };
                     // A field is a strong reference too: the overwritten referent loses one and the
                     // stored one gains it. Recorded now, applied when the chain lands (§5.5).
                     let old = heap
-                        .get_field(obj.ref_index(), idx as usize)
+                        .get_field(obj.ref_index(), slot as usize)
                         .ok_or(ExecError::BadValue)?;
-                    if !heap.set_field(obj.ref_index(), idx as usize, val) {
+                    if !heap.set_field(obj.ref_index(), slot as usize, val) {
                         return Err(ExecError::BadValue);
                     }
                     if val.tag().is_ref() {
@@ -355,6 +441,62 @@ fn run(
                     }
                     if old.tag().is_ref() {
                         env.record_ref_delta(old.ref_index(), -1);
+                    }
+                }
+                Op::GetStatic(cp) | Op::PutStatic(cp) => {
+                    let Resolved::StaticField { class, slot } = program
+                        .registry
+                        .resolve_field(owner, cp)
+                        .ok_or(ExecError::Unresolved)?
+                    else {
+                        return Err(ExecError::Unresolved);
+                    };
+                    // Touching a static field is an active use of its declaring class (§8.5).
+                    program.ensure_init(class, depth, heap)?;
+                    let k = program.registry.get(class).ok_or(ExecError::Unresolved)?;
+                    if let Op::GetStatic(_) = node.op {
+                        let v = *k.statics.borrow().get(slot).ok_or(ExecError::BadValue)?;
+                        env.write_slot(SlotId(node.id.offset), v);
+                    } else {
+                        let val = env
+                            .read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
+                        let mut statics = k.statics.borrow_mut();
+                        let cell = statics.get_mut(slot).ok_or(ExecError::BadValue)?;
+                        let old = *cell;
+                        *cell = val;
+                        drop(statics);
+                        // A static field is a root-held strong reference, counted like any other.
+                        if val.tag().is_ref() {
+                            env.record_ref_delta(val.ref_index(), 1);
+                        }
+                        if old.tag().is_ref() {
+                            env.record_ref_delta(old.ref_index(), -1);
+                        }
+                    }
+                }
+                Op::InstanceOf(cp) | Op::CheckCast(cp) => {
+                    let obj =
+                        env.read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
+                    let is_instance = if obj.tag() == Tag::Null {
+                        false // `null instanceof T` is false; a cast of null always succeeds
+                    } else {
+                        let cls = program
+                            .registry
+                            .resolve_class(owner, cp)
+                            .ok_or(ExecError::Unresolved)?;
+                        let rc = heap.get(obj.ref_index()).ok_or(ExecError::BadValue)?.class;
+                        program.registry.is_subclass_of(rc, cls)
+                    };
+                    if let Op::InstanceOf(_) = node.op {
+                        env.write_slot(
+                            SlotId(node.id.offset),
+                            Val128::from_i32(is_instance as i32),
+                        );
+                    } else {
+                        if !is_instance && obj.tag() != Tag::Null {
+                            return Err(ExecError::ClassCast);
+                        }
+                        env.write_slot(SlotId(node.id.offset), obj);
                     }
                 }
                 // Pure computations.
@@ -464,12 +606,17 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
                 _ => return Err(ExecError::UnsupportedOp),
             }
         }
-        // Calls and heap ops are dispatched in `run` (they need the Program/heap), never here.
+        // Calls, heap and class ops are dispatched in `run` (they need the registry and heap).
         Op::InvokeStatic(_)
         | Op::InvokeSpecial(_)
+        | Op::InvokeVirtual(_)
         | Op::New { .. }
         | Op::GetField(_)
-        | Op::PutField(_) => return Err(ExecError::UnsupportedOp),
+        | Op::PutField(_)
+        | Op::GetStatic(_)
+        | Op::PutStatic(_)
+        | Op::InstanceOf(_)
+        | Op::CheckCast(_) => return Err(ExecError::UnsupportedOp),
     })
 }
 
@@ -601,7 +748,6 @@ fn float_cmp(x: f64, y: f64, nan_greater: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rjava_ir::build;
 
     fn compile_slice() -> Option<Vec<u8>> {
         let src =
@@ -631,9 +777,7 @@ mod tests {
             return;
         };
         let cf = rjava_classfile::parse(&bytes).unwrap();
-        let arith = cf.method("arith", "(IIJF)I").unwrap();
-        let vm = rjava_verify::verify_method(&cf, arith).unwrap();
-        let built = build(&vm, &cf).unwrap();
+        let program = Program::from_class(&cf);
 
         let run = |a: i32, b: i32, c: i64, d: f32| -> i32 {
             let args = [
@@ -642,7 +786,11 @@ mod tests {
                 Val128::from_i64(c),
                 Val128::from_f32(d),
             ];
-            execute(&built, &args).unwrap().as_i32()
+            program
+                .call_named("arith", "(IIJF)I", &args)
+                .unwrap()
+                .unwrap()
+                .as_i32()
         };
 
         // Hand-computed oracles across all three return paths of `arith`.
@@ -834,9 +982,7 @@ public final class Oracle {
         // RustyJVM pipeline.
         let bytes = std::fs::read(dir.join("Slice.class")).unwrap();
         let cf = rjava_classfile::parse(&bytes).unwrap();
-        let arith = cf.method("arith", "(IIJF)I").unwrap();
-        let vm = rjava_verify::verify_method(&cf, arith).unwrap();
-        let built = build(&vm, &cf).unwrap();
+        let program = Program::from_class(&cf);
 
         let inputs = gen_inputs();
         let Some(oracle_results) = run_oracle(&dir, &inputs) else {
@@ -857,7 +1003,11 @@ public final class Oracle {
                 Val128::from_i64(c),
                 Val128::from_f32(d),
             ];
-            let got = execute(&built, &args).unwrap().as_i32();
+            let got = program
+                .call_named("arith", "(IIJF)I", &args)
+                .unwrap()
+                .unwrap()
+                .as_i32();
             if got != expected {
                 if mismatches < 10 {
                     eprintln!(
@@ -959,27 +1109,18 @@ public final class LoopsOracle {
 
         let bytes = std::fs::read(dir.join("Loops.class")).unwrap();
         let cf = rjava_classfile::parse(&bytes).unwrap();
-        let build_m = |name: &str, desc: &str| {
-            let m = cf.method(name, desc).unwrap();
-            let vm = rjava_verify::verify_method(&cf, m).unwrap();
-            build(&vm, &cf).unwrap()
-        };
-        let sumto = build_m("sumTo", "(I)I");
-        let factorial = build_m("factorial", "(I)J");
-        let fib = build_m("fib", "(I)I");
-        let gcd = build_m("gcd", "(II)I");
-        let collatz = build_m("collatz", "(I)I");
+        let program = Program::from_class(&cf);
 
-        // (method, a, b, built, result_is_long)
-        let mut cases: Vec<(&str, i32, i32, &BuiltMethod, bool)> = Vec::new();
+        // (method, descriptor, a, b, result_is_long)
+        let mut cases: Vec<(&str, &str, i32, i32, bool)> = Vec::new();
         for n in [-5, -1, 0, 1, 2, 3, 5, 10, 100, 1000, 10000, 46340] {
-            cases.push(("sumTo", n, 0, &sumto, false));
+            cases.push(("sumTo", "(I)I", n, 0, false));
         }
         for n in [-1, 0, 1, 2, 3, 5, 10, 13, 20, 21, 25, 40] {
-            cases.push(("factorial", n, 0, &factorial, true));
+            cases.push(("factorial", "(I)J", n, 0, true));
         }
         for n in [0, 1, 2, 3, 5, 10, 20, 45, 46, 47, 90, 92] {
-            cases.push(("fib", n, 0, &fib, false));
+            cases.push(("fib", "(I)I", n, 0, false));
         }
         for (a, b) in [
             (48, 18),
@@ -995,12 +1136,12 @@ public final class LoopsOracle {
             (270, 192),
             (1, i32::MAX),
         ] {
-            cases.push(("gcd", a, b, &gcd, false));
+            cases.push(("gcd", "(II)I", a, b, false));
         }
         for n in [
             1, 2, 3, 6, 7, 9, 27, 55, 97, 171, 703, 871, 6171, 2000, 50000, 100000,
         ] {
-            cases.push(("collatz", n, 0, &collatz, false));
+            cases.push(("collatz", "(I)I", n, 0, false));
         }
         // Random gcd pairs (Euclid terminates for every int pair).
         let mut s: u64 = 0xABCD_1234_5678_9EF1;
@@ -1009,12 +1150,12 @@ public final class LoopsOracle {
             s
         };
         for _ in 0..120 {
-            cases.push(("gcd", next() as i32, next() as i32, &gcd, false));
+            cases.push(("gcd", "(II)I", next() as i32, next() as i32, false));
         }
 
         let lines: Vec<String> = cases
             .iter()
-            .map(|(m, a, b, _, _)| format!("{m} {a} {b}"))
+            .map(|(m, _, a, b, _)| format!("{m} {a} {b}"))
             .collect();
         let Some(oracle_results) = run_loops_oracle(&dir, &lines) else {
             eprintln!("skipping differential_loops: could not run the oracle");
@@ -1022,14 +1163,15 @@ public final class LoopsOracle {
         };
         assert_eq!(oracle_results.len(), cases.len());
 
-        for ((m, a, b, built, is_long), &expected) in cases.iter().zip(&oracle_results) {
+        for ((m, desc, a, b, is_long), &expected) in cases.iter().zip(&oracle_results) {
             let args = if *m == "gcd" {
                 vec![Val128::from_i32(*a), Val128::from_i32(*b)]
             } else {
                 vec![Val128::from_i32(*a)]
             };
-            let r = match execute(built, &args) {
-                Ok(v) => v,
+            let r = match program.call_named(m, desc, &args) {
+                Ok(Some(v)) => v,
+                Ok(None) => panic!("{m}({a}, {b}) returned void"),
                 Err(e) => panic!("{m}({a}, {b}) execute failed: {e:?}"),
             };
             let got = if *is_long {
@@ -1781,7 +1923,7 @@ public final class EscapeOracle {
             let mut heap = Heap::new();
             let idx = program.method_index(m, desc).expect("method present");
             program
-                .call(idx, &[Val128::from_i32(arg)], 0, &mut heap)
+                .call(program.entry, idx, &[Val128::from_i32(arg)], 0, &mut heap)
                 .unwrap_or_else(|e| panic!("{m}({arg}) failed: {e:?}"));
             assert_eq!(
                 heap.live(),
@@ -1792,5 +1934,111 @@ public final class EscapeOracle {
             );
         }
         eprintln!("reference-count reclamation OK: no leaks across churn/chain/useReturned/local");
+    }
+
+    /// Increment-6 conformance gate: a real class hierarchy — cross-class `new`, superclass
+    /// constructors, **virtual dispatch on the runtime class**, cross-class static calls and field
+    /// reads, `instanceof`/`checkcast`, and static fields initialised by `<clinit>`.
+    #[test]
+    fn differential_hierarchy_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_hierarchy: JDK unavailable");
+            return;
+        }
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java");
+        let dir = std::env::temp_dir().join(format!("rjava-hier-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class ShapesOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            int r;
+            switch (p[0]) {
+                case "squareArea": r = Shapes.squareArea(a); break;
+                case "rectArea": r = Shapes.rectArea(a, b); break;
+                case "polymorphic": r = Shapes.polymorphic(a, b); break;
+                case "described": r = Shapes.described(a, b); break;
+                case "superCtor": r = Shapes.superCtor(a); break;
+                case "instanceOf": r = Shapes.instanceOf(a); break;
+                case "statics": r = Shapes.statics(a); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("ShapesOracle.java"), oracle).unwrap();
+        let ok = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(src_dir.join("Shape.java"))
+            .arg(src_dir.join("Square.java"))
+            .arg(src_dir.join("Rect.java"))
+            .arg(src_dir.join("Shapes.java"))
+            .arg(dir.join("ShapesOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping differential_hierarchy: javac cannot target --release 21");
+            return;
+        }
+
+        let mut cases: Vec<(&str, &str, i32, i32)> = Vec::new();
+        for n in [0, 1, 2, 3, 7, -4, 100, 46341] {
+            cases.push(("squareArea", "(I)I", n, 0));
+            cases.push(("superCtor", "(I)I", n, 0));
+            cases.push(("instanceOf", "(I)I", n, 0));
+        }
+        for (a, b) in [(2, 3), (0, 0), (-5, 4), (10, 10), (i32::MAX, 2)] {
+            cases.push(("rectArea", "(II)I", a, b));
+            cases.push(("polymorphic", "(II)I", a, b));
+            cases.push(("described", "(II)I", a, b));
+        }
+        // `statics` mutates a static field, so each call depends on the previous one — the oracle
+        // and RustyJVM must see the same running total, in the same order.
+        for n in [1, 2, 3, 10, -5] {
+            cases.push(("statics", "(I)I", n, 0));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b)| format!("{m} {a} {b}"))
+            .collect();
+        let Some(expected) = run_named_oracle(&dir, "ShapesOracle", &lines) else {
+            eprintln!("skipping differential_hierarchy: could not run the oracle");
+            return;
+        };
+        assert_eq!(expected.len(), cases.len());
+
+        // One program for the whole run so static state accumulates exactly as it does in the JVM.
+        let program = Program::from_classpath(&dir, "Shapes").expect("classpath links");
+        for ((m, desc, a, b), &want) in cases.iter().zip(&expected) {
+            let args: Vec<Val128> = if *desc == "(II)I" {
+                vec![Val128::from_i32(*a), Val128::from_i32(*b)]
+            } else {
+                vec![Val128::from_i32(*a)]
+            };
+            let got = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b}) failed: {e:?}"))
+                .unwrap_or_else(|| panic!("{m}({a},{b}) returned void"))
+                .as_i32() as i64;
+            assert_eq!(got, want, "{m}({a}, {b}) diverged from Corretto 21");
+        }
+        eprintln!(
+            "hierarchy differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
     }
 }

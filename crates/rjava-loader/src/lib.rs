@@ -188,7 +188,7 @@ impl ClassRegistry {
                     Some(s) => self.by_name.contains_key(s),
                 };
                 if super_ready {
-                    self.link(cf);
+                    self.link_class(cf);
                     progress = true;
                 } else {
                     still_pending.push(cf);
@@ -206,8 +206,8 @@ impl ClassRegistry {
     }
 
     /// Link one parsed class: verify + build its methods, lay out its fields, and extend its
-    /// superclass's dispatch table with its own virtual methods (§13.4).
-    fn link(&mut self, cf: ClassFile) {
+    /// superclass's dispatch table with its own virtual methods (§13.4). Returns its [`ClassId`].
+    pub fn link_class(&mut self, cf: ClassFile) -> ClassId {
         let name = cf.this_class_name().unwrap_or("?").to_string();
         let super_id = cf
             .super_class_name()
@@ -299,6 +299,7 @@ impl ClassRegistry {
             vindex,
             init: Cell::new(InitState::Loaded),
         });
+        id
     }
 
     pub fn get(&self, id: ClassId) -> Option<&LoadedClass> {
@@ -333,6 +334,118 @@ impl ClassRegistry {
 impl Default for ClassRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A resolved symbolic reference (§8.3). Resolution is memoised per `(class, constant-pool index)`
+/// so the string lookup happens once, while the *decision* stays runtime-determined (P-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// An instance field: its declaring class and absolute slot within an instance.
+    InstanceField { class: ClassId, slot: u16 },
+    /// A static field: its declaring class and index into that class's static storage.
+    StaticField { class: ClassId, slot: usize },
+    /// A non-virtual method target (`invokestatic`/`invokespecial`).
+    Method { class: ClassId, method: u16 },
+    /// A virtual call site: the dispatch-table slot to read from the *receiver's* class (§13.4).
+    VirtualSlot { slot: usize },
+    /// A class, for `new`/`instanceof`/`checkcast`.
+    Class(ClassId),
+    /// A cross-class method with no class file on the classpath and no observable effect —
+    /// `java/lang/Object.<init>()V`. Anything else unresolvable is an error, never a silent no-op.
+    NoOp,
+}
+
+impl ClassRegistry {
+    fn cp_names(&self, from: ClassId, cpidx: u16) -> Option<(String, String, String)> {
+        let cf = &self.get(from)?.cf;
+        let cp = &cf.constant_pool;
+        let (class_index, nat) = match cp.get(cpidx)? {
+            rjava_classfile::Constant::MethodRef {
+                class_index,
+                name_and_type_index,
+            }
+            | rjava_classfile::Constant::InterfaceMethodRef {
+                class_index,
+                name_and_type_index,
+            }
+            | rjava_classfile::Constant::FieldRef {
+                class_index,
+                name_and_type_index,
+            } => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let owner = cp.class_name(class_index)?.to_string();
+        let (n, d) = match cp.get(nat)? {
+            rjava_classfile::Constant::NameAndType {
+                name_index,
+                descriptor_index,
+            } => (*name_index, *descriptor_index),
+            _ => return None,
+        };
+        Some((owner, cp.utf8(n)?.to_string(), cp.utf8(d)?.to_string()))
+    }
+
+    /// The class a `Class` constant names (`new`, `instanceof`, `checkcast`).
+    pub fn resolve_class(&self, from: ClassId, cpidx: u16) -> Option<ClassId> {
+        let name = self.get(from)?.cf.constant_pool.class_name(cpidx)?;
+        self.by_name(name)
+    }
+
+    /// Resolve a `Fieldref` to its declaring class and slot, walking up the hierarchy: a field
+    /// referenced through a subclass is found in whichever ancestor declares it (JVMS §5.4.3.2).
+    pub fn resolve_field(&self, from: ClassId, cpidx: u16) -> Option<Resolved> {
+        let (owner, name, desc) = self.cp_names(from, cpidx)?;
+        let mut cur = self.by_name(&owner);
+        while let Some(cid) = cur {
+            let k = self.get(cid)?;
+            if let Some(slot) = k.field_slot(&name, &desc) {
+                return Some(Resolved::InstanceField { class: cid, slot });
+            }
+            if let Some(slot) = k.static_slot(&name, &desc) {
+                return Some(Resolved::StaticField { class: cid, slot });
+            }
+            cur = k.super_id;
+        }
+        None
+    }
+
+    /// Resolve a `Methodref` for `invokestatic`/`invokespecial`: the target is fixed at the named
+    /// class (or an ancestor that declares it), not dispatched on a receiver.
+    pub fn resolve_method(&self, from: ClassId, cpidx: u16) -> Option<Resolved> {
+        let (owner, name, desc) = self.cp_names(from, cpidx)?;
+        let mut cur = self.by_name(&owner);
+        while let Some(cid) = cur {
+            let k = self.get(cid)?;
+            if let Some(m) = k.method_index(&name, &desc) {
+                return Some(Resolved::Method {
+                    class: cid,
+                    method: m,
+                });
+            }
+            cur = k.super_id;
+        }
+        // `java/lang/Object.<init>()V` is the one absent target that is genuinely effect-free.
+        if owner == "java/lang/Object" && name == "<init>" && desc == "()V" {
+            return Some(Resolved::NoOp);
+        }
+        None
+    }
+
+    /// Resolve an `invokevirtual` call site to a **dispatch-table slot**. The slot is read from the
+    /// *receiver's* class at every call, so a later subclass simply fills the slot differently and
+    /// no call site — interpreted or compiled — is invalidated (§13.4).
+    pub fn resolve_virtual(&self, from: ClassId, cpidx: u16) -> Option<Resolved> {
+        let (owner, name, desc) = self.cp_names(from, cpidx)?;
+        let mut cur = self.by_name(&owner);
+        while let Some(cid) = cur {
+            let k = self.get(cid)?;
+            if let Some(slot) = k.vslot(&name, &desc) {
+                return Some(Resolved::VirtualSlot { slot });
+            }
+            cur = k.super_id;
+        }
+        None
     }
 }
 
