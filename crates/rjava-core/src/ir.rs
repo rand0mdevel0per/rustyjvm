@@ -69,6 +69,10 @@ pub enum Op {
     /// `(input <cond> 0) ? 1 : 0`, as int. Produced for `if<cond>` so a nonzero-testing
     /// [`Terminator::CondBranch`] can express the JVM branch condition.
     TestZero(IntCond),
+    /// `(reference is null) == expect_null ? 1 : 0`, as int. Produced for `ifnull`/`ifnonnull`.
+    TestNull {
+        expect_null: bool,
+    },
     /// `(a <cond> b) ? 1 : 0`, as int (two operands). Produced for `if_icmp<cond>`.
     ICmp(IntCond),
     /// Bitwise AND (typed by [`Node::ty`]: int or long). Other bitwise/shift ops are added on

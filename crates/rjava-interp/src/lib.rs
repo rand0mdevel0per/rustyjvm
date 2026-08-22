@@ -10,8 +10,8 @@
 //! results bit-identical to Corretto.
 
 use rjava_core::{
-    BlockId, ClassId, Effect, Env, EscapeState, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator,
-    Val128,
+    BlockId, ClassId, Effect, Env, EscapeState, IntCond, LogicalFrame, Op, RefIndex, SlotId, Tag,
+    Terminator, Val128,
 };
 use rjava_gc::Heap;
 use rjava_ir::BuiltMethod;
@@ -147,6 +147,13 @@ impl Program {
         )
     }
 
+    /// The class-table index of a method, by name and descriptor.
+    pub fn method_index(&self, name: &str, desc: &str) -> Option<u16> {
+        self.by_name
+            .get(&(name.to_string(), desc.to_string()))
+            .copied()
+    }
+
     /// Invoke a method by name + descriptor (the launcher/test entry point).
     pub fn call_named(
         &self,
@@ -167,6 +174,58 @@ impl Program {
 pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError> {
     let mut heap = Heap::new();
     run(None, built, args, 0, LogicalFrame(0), &mut heap)?.ok_or(ExecError::BadValue)
+}
+
+/// Land a chain: apply its recorded reference-count deltas to the heap in program order, then
+/// commit its slot writes (§5.5, §10.5). `buf` is reused across landings to avoid allocating.
+#[inline]
+fn land_chain(env: &mut Env, heap: &mut Heap, buf: &mut Vec<(RefIndex, i32)>) {
+    env.drain_ref_deltas(buf);
+    if !buf.is_empty() {
+        heap.apply_rc_deltas(buf);
+    }
+    env.land();
+}
+
+/// Leave a frame: land whatever is still pending, then release the references its slots held.
+///
+/// The returned reference is handed to the caller as an *in-transit* reference (+1) inside the same
+/// batch that releases the slots, so it cannot be reclaimed in between; the caller drops that
+/// in-transit reference once a slot of its own owns it. Scope-exclusive (S1) objects were never
+/// counted at all — they are reclaimed here by RAII (§5.1), which also releases anything their
+/// fields referenced.
+fn leave_frame(
+    env: &mut Env,
+    heap: &mut Heap,
+    buf: &mut Vec<(RefIndex, i32)>,
+    n_slots: usize,
+    returned: Option<Val128>,
+) {
+    land_chain(env, heap, buf);
+
+    buf.clear();
+    if let Some(v) = returned {
+        if v.tag().is_ref() {
+            buf.push((v.ref_index(), 1)); // in-transit reference for the caller
+        }
+    }
+    for i in 0..n_slots {
+        let v = env.read_slot(SlotId(i as u16));
+        if v.tag() == Tag::Ptr {
+            buf.push((v.ref_index(), -1));
+        }
+    }
+    if !buf.is_empty() {
+        heap.apply_rc_deltas(buf);
+    }
+    // S1 handles die with the scope that owned them (§5.1). A handle may sit in several slots
+    // (a φ merge); reclaiming is idempotent, so the repeat is harmless.
+    for i in 0..n_slots {
+        let v = env.read_slot(SlotId(i as u16));
+        if v.tag() == Tag::Handle {
+            heap.free(v.ref_index());
+        }
+    }
 }
 
 /// Execute a built method over a fresh Env register file. `program` is needed only if the method
@@ -195,6 +254,9 @@ fn run(
     let mut cur = built.method.entry;
     let mut prev: Option<BlockId> = None;
     let mut steps: u64 = 0;
+    // Reused across landings so the reference-count batches cost no allocation.
+    let mut rc_buf: Vec<(RefIndex, i32)> = Vec::new();
+    let n_slots = built.n_slots.max(1);
     loop {
         steps += 1;
         if steps > 100_000_000 {
@@ -229,7 +291,7 @@ fn run(
             // `Effect::Extern` is a fence: it is never speculated and its predecessors land in
             // program order before it runs (§10.6). Calls carry this effect.
             if node.effect == Effect::Extern {
-                env.land();
+                land_chain(&mut env, heap, &mut rc_buf);
             }
             match node.op {
                 // Calls (need the Program + recursion + shared heap).
@@ -241,6 +303,11 @@ fn run(
                     }
                     if let Some(r) = prog.call(index, &argv, depth + 1, heap)? {
                         env.write_slot(SlotId(node.id.offset), r);
+                        // The callee handed over an in-transit reference; now that a slot of ours
+                        // owns it, drop that extra reference (both deltas land together).
+                        if r.tag().is_ref() {
+                            env.record_ref_delta(r.ref_index(), -1);
+                        }
                     }
                 }
                 // Heap operations.
@@ -275,8 +342,19 @@ fn run(
                     if obj.tag() == Tag::Null {
                         return Err(ExecError::NullPointer);
                     }
+                    // A field is a strong reference too: the overwritten referent loses one and the
+                    // stored one gains it. Recorded now, applied when the chain lands (§5.5).
+                    let old = heap
+                        .get_field(obj.ref_index(), idx as usize)
+                        .ok_or(ExecError::BadValue)?;
                     if !heap.set_field(obj.ref_index(), idx as usize, val) {
                         return Err(ExecError::BadValue);
+                    }
+                    if val.tag().is_ref() {
+                        env.record_ref_delta(val.ref_index(), 1);
+                    }
+                    if old.tag().is_ref() {
+                        env.record_ref_delta(old.ref_index(), -1);
                     }
                 }
                 // Pure computations.
@@ -292,8 +370,15 @@ fn run(
         }
 
         match &block.term {
-            Terminator::Return(Some(v)) => return Ok(Some(env.read_slot(SlotId(v.offset)))),
-            Terminator::Return(None) => return Ok(None),
+            Terminator::Return(Some(v)) => {
+                let rv = env.read_slot(SlotId(v.offset));
+                leave_frame(&mut env, heap, &mut rc_buf, n_slots, Some(rv));
+                return Ok(Some(rv));
+            }
+            Terminator::Return(None) => {
+                leave_frame(&mut env, heap, &mut rc_buf, n_slots, None);
+                return Ok(None);
+            }
             Terminator::Goto(b) => {
                 prev = Some(cur);
                 cur = *b;
@@ -312,7 +397,7 @@ fn run(
         // End of chain: land this block's diff into the environment in program order (§10.5).
         // Landing incrementally — rather than batching at scope exit — is what keeps intra-vt
         // execution as-if-serial and makes the increment-8 po-truncation on a caught throw correct.
-        env.land();
+        land_chain(&mut env, heap, &mut rc_buf);
     }
 }
 
@@ -352,6 +437,10 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
                 IntCond::Le => v <= 0,
             };
             Val128::from_i32(taken as i32)
+        }
+        Op::TestNull { expect_null } => {
+            let is_null = ins.first().ok_or(ExecError::BadValue)?.tag() == Tag::Null;
+            Val128::from_i32((is_null == expect_null) as i32)
         }
         Op::ICmp(cond) => {
             let a = ins.first().ok_or(ExecError::BadValue)?.as_i32();
@@ -1555,5 +1644,153 @@ public final class PointOracle {
             "objects differential OK: {} cases match Corretto 21",
             cases.len()
         );
+    }
+
+    /// Increment-5 conformance gate: escape analysis (S1 vs S2) and the reference-count fast path
+    /// must not change observable results — every case still matches Corretto 21.
+    #[test]
+    fn differential_escape_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_escape: JDK unavailable");
+            return;
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/java/Escape.java");
+        let dir = std::env::temp_dir().join(format!("rjava-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class EscapeOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = Integer.parseInt(p[1]);
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            int r;
+            switch (p[0]) {
+                case "local": r = Escape.local(a); break;
+                case "useReturned": r = Escape.useReturned(a); break;
+                case "stored": r = Escape.stored(a, b); break;
+                case "chain": r = Escape.chain(a); break;
+                case "churn": r = Escape.churn(a); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("EscapeOracle.java"), oracle).unwrap();
+        if !std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("EscapeOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping differential_escape: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Escape.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        let mut cases: Vec<(&str, &str, i32, i32)> = Vec::new();
+        for n in [0, 1, 2, 7, -3, 100, i32::MAX, i32::MIN] {
+            cases.push(("local", "(I)I", n, 0));
+            cases.push(("useReturned", "(I)I", n, 0));
+        }
+        for (a, b) in [(1, 2), (0, 0), (-5, 9), (i32::MAX, 1), (100, 200)] {
+            cases.push(("stored", "(II)I", a, b));
+        }
+        for n in [0, 1, 2, 5, 10, 50, 200] {
+            cases.push(("chain", "(I)I", n, 0));
+            cases.push(("churn", "(I)I", n, 0));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b)| format!("{m} {a} {b}"))
+            .collect();
+        let Some(expected) = run_named_oracle(&dir, "EscapeOracle", &lines) else {
+            eprintln!("skipping differential_escape: could not run the oracle");
+            return;
+        };
+        assert_eq!(expected.len(), cases.len());
+
+        for ((m, desc, a, b), &want) in cases.iter().zip(&expected) {
+            let args: Vec<Val128> = if *desc == "(II)I" {
+                vec![Val128::from_i32(*a), Val128::from_i32(*b)]
+            } else {
+                vec![Val128::from_i32(*a)]
+            };
+            let got = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b}) failed: {e:?}"))
+                .unwrap_or_else(|| panic!("{m}({a},{b}) returned void"))
+                .as_i32() as i64;
+            assert_eq!(got, want, "{m}({a}, {b}) diverged from Corretto 21");
+        }
+        eprintln!(
+            "escape/rc differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
+    }
+
+    /// The reference-count fast path must actually reclaim: after a call tree that allocates
+    /// hundreds of objects — local (S1, RAII) and escaping (S2, counted) alike — the heap must be
+    /// empty again, and the count must have driven that (§5.1, §5.2, §6.2).
+    #[test]
+    fn objects_are_reclaimed_when_unreferenced() {
+        if !tool_ok("javac") {
+            eprintln!("skipping reclamation test: javac unavailable");
+            return;
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/java/Escape.java");
+        let dir = std::env::temp_dir().join(format!("rjava-rc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if !std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping reclamation test: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Escape.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        for (m, desc, arg) in [
+            ("churn", "(I)I", 300),     // S1 objects, reclaimed by RAII at scope exit
+            ("chain", "(I)I", 200),     // an S2 chain, reclaimed by cascading rc release
+            ("useReturned", "(I)I", 5), // an S2 object handed across a frame boundary
+            ("local", "(I)I", 3),
+        ] {
+            let mut heap = Heap::new();
+            let idx = program.method_index(m, desc).expect("method present");
+            program
+                .call(idx, &[Val128::from_i32(arg)], 0, &mut heap)
+                .unwrap_or_else(|e| panic!("{m}({arg}) failed: {e:?}"));
+            assert_eq!(
+                heap.live(),
+                0,
+                "{m}({arg}) leaked {} objects — every allocation must be reclaimed once \
+                 unreferenced",
+                heap.live()
+            );
+        }
+        eprintln!("reference-count reclamation OK: no leaks across churn/chain/useReturned/local");
     }
 }

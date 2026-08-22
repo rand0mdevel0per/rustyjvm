@@ -589,6 +589,14 @@ fn apply(
                 f.push(r, max_stack, pc)?;
             }
         }
+        0xb0 => {
+            // areturn: the returned reference must match a reference return type.
+            f.pop_expect(VType::Reference, pc)?;
+            if !matches!(ret, Some(VType::Reference)) {
+                return Err(VerifyError::BadReturn(pc));
+            }
+        }
+        0xc6 | 0xc7 => f.pop_expect(VType::Reference, pc)?, // ifnull / ifnonnull
         0xb1 => {
             // return (void)
             if ret.is_some() {

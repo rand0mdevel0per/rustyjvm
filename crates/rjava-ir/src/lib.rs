@@ -240,10 +240,6 @@ fn if_icmp_cond(op: u8) -> IntCond {
     }
 }
 
-fn is_return(op: u8) -> bool {
-    (0xac..=0xb1).contains(&op)
-}
-
 /// Basic-block leaders: entry, every branch target, and the instruction after every branch/return.
 fn leaders(insns: &[Insn], valid: &HashMap<u32, usize>) -> Vec<u32> {
     let mut set = BTreeSet::new();
@@ -605,9 +601,24 @@ impl Ssa {
                         .ok_or(IrError::BadBlock(pc))?;
                     term = Some(Terminator::Goto(taken));
                 }
-                0xac | 0xad => {
+                0xac | 0xad | 0xb0 => {
                     let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     term = Some(Terminator::Return(Some(v)));
+                }
+                0xc6 | 0xc7 => {
+                    // ifnull / ifnonnull: test the reference, then branch on the int result.
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let cond = self.fresh()?;
+                    nodes.push(Node {
+                        id: cond,
+                        op: Op::TestNull {
+                            expect_null: ins.op == 0xc6,
+                        },
+                        ins: smallvec![v],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    term = Some(cond_branch(cond, ins, block_of, pc)?);
                 }
                 0xb8 => {
                     // invokestatic: pop the arguments (reverse), emit a call node, push the result.
@@ -622,6 +633,7 @@ impl Ssa {
                         Some(VType::Long) => Tag::I64,
                         Some(VType::Float) => Tag::F32,
                         Some(VType::Double) => Tag::F64,
+                        Some(VType::Reference) | Some(VType::Null) => Tag::Ptr,
                         Some(_) => return Err(IrError::Unsupported { op: 0xb8, pc }),
                     };
                     let id = self.fresh()?;
@@ -721,6 +733,7 @@ impl Ssa {
                             Some(VType::Long) => Tag::I64,
                             Some(VType::Float) => Tag::F32,
                             Some(VType::Double) => Tag::F64,
+                            Some(VType::Reference) | Some(VType::Null) => Tag::Ptr,
                             Some(_) => return Err(IrError::Unsupported { op: 0xb7, pc }),
                         };
                         let id = self.fresh()?;
@@ -776,32 +789,31 @@ fn successors(
     nblocks: usize,
     block_of: &HashMap<u32, BlockId>,
 ) -> Vec<BlockId> {
-    let next = |bidx: usize| -> Vec<BlockId> {
+    let fall_through = |bidx: usize| -> Vec<BlockId> {
         if bidx + 1 < nblocks {
             vec![BlockId((bidx + 1) as u32)]
         } else {
             vec![]
         }
     };
-    match last {
-        Some(ins) if (0x99..=0xa4).contains(&ins.op) => {
-            let mut s = Vec::new();
-            if let Some(t) = ins.branch_target().and_then(|t| block_of.get(&t)) {
-                s.push(*t);
-            }
-            if let Some(&fb) = block_of.get(&(ins.pc + ins.len as u32)) {
-                s.push(fb);
-            }
-            s
-        }
-        Some(ins) if ins.op == 0xa7 => ins
-            .branch_target()
-            .and_then(|t| block_of.get(&t))
-            .map(|b| vec![*b])
-            .unwrap_or_default(),
-        Some(ins) if is_return(ins.op) => vec![],
-        _ => next(bidx),
+    let Some(ins) = last else {
+        return fall_through(bidx);
+    };
+    // Derived from the decoder's own predicates rather than a second opcode list, so a new branch
+    // or return opcode cannot leave a target unreachable here (which would silently drop the
+    // target block's terminator).
+    let mut out = Vec::new();
+    if let Some(t) = ins.branch_target().and_then(|t| block_of.get(&t)) {
+        out.push(*t);
     }
+    if !ins.is_unconditional_end() {
+        // A conditional branch also falls through; a plain instruction only falls through.
+        match block_of.get(&(ins.pc + ins.len as u32)) {
+            Some(&fb) => out.push(fb),
+            None => out.extend(fall_through(bidx)),
+        }
+    }
+    out
 }
 
 /// Reverse post-order of the reachable blocks from `entry`.
@@ -830,6 +842,75 @@ fn reverse_postorder(
     }
     post.reverse();
     post
+}
+
+/// Escape analysis (§9.4): classify each allocation as S1 (scope-exclusive) or S2 (thread-local
+/// shared), promoting the node's `escape` and its static tag accordingly.
+///
+/// A value escapes its scope if it is returned, thrown, stored into an object's field, or passed to
+/// a call (conservative — without interprocedural analysis the callee might retain it). A φ that
+/// escapes makes all of its sources escape, so the seeds are propagated to a fixpoint.
+///
+/// Classification is deliberately **conservative**: when non-escape cannot be proven the allocation
+/// is promoted to the more general state, never under-classified (§9.4). Objects that stay S1 cost
+/// nothing at all — no reference count, no barrier — which is the point (P-2, §5.1).
+fn mark_escapes(blocks: &mut [Block]) {
+    let mut escaping: HashSet<ValId> = HashSet::new();
+
+    for b in blocks.iter() {
+        for n in &b.nodes {
+            match n.op {
+                // The stored value outlives this scope inside the receiver.
+                Op::PutField(_) => {
+                    if let Some(v) = n.ins.get(1) {
+                        escaping.insert(*v);
+                    }
+                }
+                // Arguments (and an `<init>` receiver) may be retained by the callee.
+                Op::InvokeStatic(_) | Op::InvokeSpecial(_) => {
+                    escaping.extend(n.ins.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        match &b.term {
+            Terminator::Return(Some(v)) | Terminator::Throw(v) => {
+                escaping.insert(*v);
+            }
+            _ => {}
+        }
+    }
+
+    // A φ merges its sources into one value: if the merged value escapes, each source does too.
+    loop {
+        let mut changed = false;
+        for b in blocks.iter() {
+            for p in &b.phis {
+                if escaping.contains(&p.slot) {
+                    for (_, src) in &p.sources {
+                        changed |= escaping.insert(*src);
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for b in blocks.iter_mut() {
+        for n in &mut b.nodes {
+            if let Op::New { n_fields, .. } = n.op {
+                if escaping.contains(&n.id) {
+                    n.op = Op::New {
+                        escape: EscapeState::S2,
+                        n_fields,
+                    };
+                    n.ty = Tag::Ptr; // shared reference, no longer a move-only handle (§4.2)
+                }
+            }
+        }
+    }
 }
 
 /// Build the L1 SSA form of a verified method.
@@ -997,6 +1078,8 @@ pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError
             term: term_of[idx].take().unwrap_or(Terminator::Return(None)),
         });
     }
+
+    mark_escapes(&mut blocks);
 
     Ok(BuiltMethod {
         method: Method {

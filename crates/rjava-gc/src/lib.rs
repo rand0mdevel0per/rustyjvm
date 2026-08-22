@@ -109,23 +109,73 @@ impl Heap {
     }
 
     /// Reclaim a **scope-exclusive (S1)** object at scope exit (RAII, §5.1); its index returns to
-    /// the free list. Returns `false` — reclaiming nothing — for an S2/S3 object or an invalid
-    /// reference: a shared object must be released through its reference-count lifecycle (§5.2,
-    /// §5.3, increment 5), because recycling its index while `ptr` values still name it would let
-    /// them address a later, unrelated object.
+    /// the free list, and any references it held in its fields are released (cascading, since that
+    /// may reclaim further objects). Returns `false` — reclaiming nothing — for an S2/S3 object or
+    /// an invalid reference: a shared object must be released through its reference-count lifecycle
+    /// (§5.2, §5.3), because recycling its index while `ptr` values still name it would let them
+    /// address a later, unrelated object.
     pub fn free(&mut self, r: RefIndex) -> bool {
-        let slot = match self.slots.get_mut(r.0 as usize) {
-            Some(s) => s,
-            None => return false,
-        };
-        match slot.as_ref().map(|o| o.escape) {
-            Some(EscapeState::S1) => {
-                *slot = None;
-                self.free.push(r.0);
-                self.live -= 1;
-                true
+        if self.escape_of(r) != Some(EscapeState::S1) {
+            return false;
+        }
+        self.reclaim_cascading(r);
+        true
+    }
+
+    /// Reclaim `r` and release the references its fields held, following the chain of objects that
+    /// become unreferenced as a result (the acyclic fast path, §6.2). Strong cycles survive this
+    /// and are collected by the concurrent cycle collector in increment 9 (§6.3).
+    fn reclaim_cascading(&mut self, r: RefIndex) {
+        let mut work = vec![r];
+        while let Some(cur) = work.pop() {
+            let Some(obj) = self.slots.get_mut(cur.0 as usize).and_then(Option::take) else {
+                continue; // already reclaimed
+            };
+            self.free.push(cur.0);
+            self.live -= 1;
+            // Releasing the object's own field references may leave further objects unreferenced.
+            for v in obj.fields {
+                if !v.tag().is_ref() {
+                    continue;
+                }
+                let referent = v.ref_index();
+                if self.add_rc_only(referent, -1) == Some(true) {
+                    work.push(referent);
+                }
             }
-            _ => false,
+        }
+    }
+
+    /// Apply a delta without reclaiming. Returns `Some(true)` when the object is now unreferenced
+    /// (and reclaimable), `Some(false)` when it is still referenced or is S1, `None` if not live.
+    fn add_rc_only(&mut self, r: RefIndex, delta: i64) -> Option<bool> {
+        let obj = self.slots.get_mut(r.0 as usize)?.as_mut()?;
+        if obj.escape == EscapeState::S1 {
+            return Some(false); // scope-exclusive: RAII, not reference counting
+        }
+        obj.rc += delta;
+        debug_assert!(
+            obj.rc >= 0,
+            "reference count underflowed for {r:?} — a release without a matching acquire (§5.5)"
+        );
+        Some(obj.rc <= 0)
+    }
+
+    /// Apply a batch of reference-count deltas recorded by a diff chain (§5.5).
+    ///
+    /// Deltas are applied **in program order**, exactly as recorded — they are metadata, never a
+    /// data dependency, so they never merge otherwise-independent chains. Reclamation is decided
+    /// only once the whole batch has been applied: an object whose count dips to zero *mid-batch*
+    /// and is re-acquired later in the same batch (a reference moving between slots) must not be
+    /// destroyed underneath its new owner.
+    pub fn apply_rc_deltas(&mut self, deltas: &[(RefIndex, i32)]) {
+        for &(r, d) in deltas {
+            self.add_rc_only(r, d as i64);
+        }
+        for &(r, _) in deltas {
+            if self.add_rc_only(r, 0) == Some(true) {
+                self.reclaim_cascading(r);
+            }
         }
     }
 
@@ -159,34 +209,20 @@ impl Heap {
         }
     }
 
-    /// Apply a reference-count delta to a shared (S2+) object, reclaiming it when the count reaches
-    /// zero. Returns the new count, or `None` if the reference is not live.
+    /// Apply a single reference-count delta to a shared (S2+) object, reclaiming it when the count
+    /// reaches zero. Returns the new count, or `None` if the reference is not live.
     ///
-    /// Callers MUST apply deltas at **diff-landing time, in program order** — never eagerly during
-    /// speculation (§5.5). Counts are metadata: they never merge otherwise-independent chains.
-    ///
-    /// S1 objects carry no count and are reclaimed by RAII instead ([`Heap::free`], §5.1), so a
-    /// delta against one is ignored.
+    /// Prefer [`Heap::apply_rc_deltas`] for a chain's recorded deltas: it applies the whole batch in
+    /// program order before deciding what to reclaim, so a reference moving between slots is not
+    /// destroyed mid-batch. S1 objects carry no count and are reclaimed by RAII instead
+    /// ([`Heap::free`], §5.1), so a delta against one is ignored.
     pub fn add_rc(&mut self, r: RefIndex, delta: i64) -> Option<i64> {
-        let slot = self.slots.get_mut(r.0 as usize)?;
-        let obj = slot.as_mut()?;
-        if obj.escape == EscapeState::S1 {
-            return Some(0); // scope-exclusive: RAII, not reference counting
+        let dead = self.add_rc_only(r, delta)?;
+        if dead {
+            self.reclaim_cascading(r);
+            return Some(0);
         }
-        obj.rc += delta;
-        debug_assert!(
-            obj.rc >= 0,
-            "reference count underflowed for {r:?} — a release without a matching acquire (§5.5)"
-        );
-        let now = obj.rc;
-        if now <= 0 {
-            // The last reference went away: reclaim immediately (the acyclic fast path, §6.2).
-            // Strong cycles are collected by the concurrent cycle collector in increment 9 (§6.3).
-            *slot = None;
-            self.free.push(r.0);
-            self.live -= 1;
-        }
-        Some(now)
+        self.rc(r)
     }
 }
 
@@ -299,6 +335,46 @@ mod tests {
         let again = h.alloc(ClassId(1), EscapeState::S2, Vec::new()).unwrap();
         assert_eq!(again, r);
         assert_eq!(h.rc(again), Some(0), "a recycled slot starts fresh");
+    }
+
+    #[test]
+    fn reclaiming_releases_field_references_transitively() {
+        // The acyclic fast path (§6.2): dropping the head of a chain must release the whole chain.
+        let mut h = Heap::new();
+        let c = h
+            .alloc(ClassId(0), EscapeState::S2, vec![Val128::null()])
+            .unwrap();
+        let b = h
+            .alloc(ClassId(0), EscapeState::S2, vec![Val128::ptr(c)])
+            .unwrap();
+        let a = h
+            .alloc(ClassId(0), EscapeState::S2, vec![Val128::ptr(b)])
+            .unwrap();
+        h.add_rc(a, 1); // a local names the head
+        h.add_rc(b, 1); // a.next
+        h.add_rc(c, 1); // b.next
+        assert_eq!(h.live(), 3);
+        // Releasing the only reference to the head cascades through b and c.
+        assert_eq!(h.add_rc(a, -1), Some(0));
+        assert_eq!(h.live(), 0);
+        assert!(h.get(b).is_none() && h.get(c).is_none());
+    }
+
+    #[test]
+    fn a_reference_moving_between_slots_survives_its_batch() {
+        // §5.5: deltas apply in program order, but reclamation is decided only after the whole
+        // batch — otherwise a reference whose count dips to zero mid-batch (released from one slot
+        // before being acquired by another) would be destroyed underneath its new owner.
+        let mut h = Heap::new();
+        let r = h.alloc(ClassId(0), EscapeState::S2, Vec::new()).unwrap();
+        h.add_rc(r, 1); // held by one slot
+        h.apply_rc_deltas(&[(r, -1), (r, 1)]); // released, then re-acquired
+        assert!(h.get(r).is_some(), "must survive the transient zero");
+        assert_eq!(h.rc(r), Some(1));
+        // Ending a batch at zero does reclaim.
+        h.apply_rc_deltas(&[(r, -1)]);
+        assert!(h.get(r).is_none());
+        assert_eq!(h.live(), 0);
     }
 
     #[test]
