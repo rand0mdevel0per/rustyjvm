@@ -236,12 +236,14 @@ mod tests {
     #[test]
     fn fork_snapshots_are_gc_roots() {
         // §6.3: an object reachable only from an in-flight fork must be enumerable as a root.
+        // A snapshot never carries an S1 `handle` — a handle is move-only (§4.2), so anything a
+        // second chain can reach has escaped and was promoted to a shared `ptr` first (§5.4).
         let mut reg = ForkRegistry::new();
         let snap = EnvSnapshot {
             slots: vec![
-                Val128::from_i32(1),          // not a reference
-                Val128::handle(RefIndex(77)), // S1 handle
-                Val128::ptr(RefIndex(88)),    // shared pointer
+                Val128::from_i32(1),       // not a reference
+                Val128::ptr(RefIndex(77)), // shared pointer
+                Val128::ptr(RefIndex(88)),
                 Val128::null(),
             ],
         };

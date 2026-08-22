@@ -97,13 +97,24 @@ impl Heap {
         }
     }
 
-    /// Reclaim an object (S1 RAII / scope-exit drop, §5.1). Its index returns to the free list.
-    pub fn free(&mut self, r: RefIndex) {
-        if let Some(slot) = self.slots.get_mut(r.0 as usize) {
-            if slot.take().is_some() {
+    /// Reclaim a **scope-exclusive (S1)** object at scope exit (RAII, §5.1); its index returns to
+    /// the free list. Returns `false` — reclaiming nothing — for an S2/S3 object or an invalid
+    /// reference: a shared object must be released through its reference-count lifecycle (§5.2,
+    /// §5.3, increment 5), because recycling its index while `ptr` values still name it would let
+    /// them address a later, unrelated object.
+    pub fn free(&mut self, r: RefIndex) -> bool {
+        let slot = match self.slots.get_mut(r.0 as usize) {
+            Some(s) => s,
+            None => return false,
+        };
+        match slot.as_ref().map(|o| o.escape) {
+            Some(EscapeState::S1) => {
+                *slot = None;
                 self.free.push(r.0);
                 self.live -= 1;
+                true
             }
+            _ => false,
         }
     }
 
@@ -150,7 +161,7 @@ mod tests {
             .alloc(ClassId(0), EscapeState::S1, vec![Val128::null(); 1])
             .unwrap();
         assert_eq!(h.live(), 2);
-        h.free(a);
+        assert!(h.free(a));
         assert_eq!(h.live(), 1);
         assert!(h.get(a).is_none());
         // The freed index is reused by the next allocation.
@@ -158,6 +169,27 @@ mod tests {
             .alloc(ClassId(0), EscapeState::S1, vec![Val128::null(); 1])
             .unwrap();
         assert_eq!(c, a);
+        assert_eq!(h.live(), 2);
+    }
+
+    #[test]
+    fn free_refuses_shared_objects_and_bad_references() {
+        // Regression for a review finding: recycling an S2/S3 index while `ptr` values still name
+        // it would let them address a later, unrelated object. Shared objects are released through
+        // their reference-count lifecycle instead (§5.2, §5.3).
+        let mut h = Heap::new();
+        let s2 = h.alloc(ClassId(0), EscapeState::S2, Vec::new()).unwrap();
+        let s3 = h.alloc(ClassId(0), EscapeState::S3, Vec::new()).unwrap();
+        assert!(!h.free(s2), "S2 must not be freed by the RAII path");
+        assert!(!h.free(s3), "S3 must not be freed by the RAII path");
+        assert!(h.get(s2).is_some());
+        assert!(h.get(s3).is_some());
+        assert_eq!(h.live(), 2);
+        // A dangling or already-freed reference is a no-op, never a panic or a live-count underflow.
+        assert!(!h.free(RefIndex(9999)));
+        let s1 = h.alloc(ClassId(0), EscapeState::S1, Vec::new()).unwrap();
+        assert!(h.free(s1));
+        assert!(!h.free(s1), "double free is refused");
         assert_eq!(h.live(), 2);
     }
 

@@ -26,12 +26,18 @@ pub const MAX_SLOTS: usize = 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LogicalFrame(pub u32);
 
-/// A single scope's slot storage plus its unlanded diff.
+/// A single scope's slot storage plus its undo journal.
+///
+/// Slots hold the *working* state so reads and writes are O(1). The journal records each write's
+/// **previous** value in program order, which is what makes the diff semantics work: landing simply
+/// forgets the journal, discarding replays it backwards, and a fork snapshot is reconstructed by
+/// undoing it. (Recording pre-images rather than scanning a pending list keeps straight-line
+/// execution linear instead of quadratic.)
 pub struct Env {
-    /// Landed state: everything whose program order has already passed.
+    /// Working state: landed writes plus this chain's unlanded ones.
     slots: Vec<Val128>,
-    /// Unlanded writes, in program order (§9.6 `DiffNode::diff`).
-    pending: SmallVec<[(u16, Val128); 8]>,
+    /// Undo journal for unlanded writes: `(slot, value before the write)`, in program order.
+    journal: SmallVec<[(u16, Val128); 8]>,
     frame: LogicalFrame,
 }
 
@@ -44,61 +50,68 @@ impl Env {
         );
         Env {
             slots: vec![Val128::null(); n_slots],
-            pending: SmallVec::new(),
+            journal: SmallVec::new(),
             frame,
         }
     }
 
-    /// Read a slot. THE indirection seam (§10.4): the newest unlanded write in this chain's diff
-    /// wins; otherwise the landed base is read. A chain therefore never observes another chain's
-    /// unlanded writes (snapshot isolation).
+    /// Read a slot. THE indirection seam (§10.4): this chain sees its own unlanded writes; another
+    /// chain, which reads its own forked snapshot, does not (snapshot isolation).
     #[inline]
     pub fn read_slot(&self, s: SlotId) -> Val128 {
-        // The pending window is one chain's writes, so a reverse scan is short.
-        for &(slot, v) in self.pending.iter().rev() {
-            if slot == s.0 {
-                return v;
-            }
-        }
         self.slots[s.index()]
     }
 
-    /// Write a slot. THE indirection seam (§10.4): the write is recorded in the pending diff in
-    /// program order rather than mutating the landed state; [`Env::land`] applies it.
+    /// Write a slot. THE indirection seam (§10.4): the previous value is journalled first, so the
+    /// write belongs to the unlanded diff until [`Env::land`] commits it.
     #[inline]
     pub fn write_slot(&mut self, s: SlotId, v: Val128) {
-        self.pending.push((s.0, v));
+        self.journal.push((s.0, self.slots[s.index()]));
+        self.slots[s.index()] = v;
     }
 
-    /// Land the pending diff into the base **in program order** (§10.5). Called as program order
-    /// advances — at chain (block) boundaries and before every `Effect::Extern` fence (§10.6) —
-    /// never batched at scope exit.
+    /// Land the pending diff **in program order** (§10.5): the writes become permanent, so the undo
+    /// journal is dropped. Called as program order advances — at chain (block) boundaries and
+    /// before every `Effect::Extern` fence (§10.6) — never batched at scope exit.
     #[inline]
     pub fn land(&mut self) {
-        for (slot, v) in self.pending.drain(..) {
-            self.slots[slot as usize] = v;
-        }
+        self.journal.clear();
     }
 
-    /// Discard unlanded writes (mis-speculation, or the `po > throw` tail of an abandoned path,
-    /// §20.4–20.5). Landed state is never rolled back — the model is oneshot (§10.3).
+    /// Discard unlanded writes by replaying the journal backwards (mis-speculation, or the
+    /// `po > throw` tail of an abandoned path, §20.4–20.5). Landed state is never rolled back —
+    /// the model is oneshot (§10.3).
     #[inline]
     pub fn discard_pending(&mut self) {
-        self.pending.clear();
+        while let Some((slot, old)) = self.journal.pop() {
+            self.slots[slot as usize] = old;
+        }
     }
 
     /// Number of unlanded writes.
     #[inline]
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.journal.len()
     }
 
-    /// A copy-on-write snapshot of the landed state, for forking a parallel chain (§10.4) and as a
-    /// GC root while the fork is live (§6.3).
+    /// A copy-on-write snapshot of the **landed** state, for forking a parallel chain (§10.4) and
+    /// as a GC root while the fork is live (§6.3).
+    ///
+    /// A snapshot must not carry an S1 `handle`: a handle is move-only and MUST NOT be duplicated
+    /// (§4.2), so an object reachable by a second chain has by definition escaped and must first be
+    /// promoted to S2/`ptr` (§5.4). Promotion is implemented in increment 5; until then the
+    /// debug assertion below makes a violation loud rather than silent.
     pub fn snapshot(&self) -> EnvSnapshot {
-        EnvSnapshot {
-            slots: self.slots.clone(),
+        let mut slots = self.slots.clone();
+        // Undo unlanded writes (reverse order) to recover the landed state.
+        for &(slot, old) in self.journal.iter().rev() {
+            slots[slot as usize] = old;
         }
+        debug_assert!(
+            !slots.iter().any(|v| v.tag() == crate::value::Tag::Handle),
+            "an S1 handle must be promoted to S2 before it can be reached by a forked chain (§4.2, §5.4)"
+        );
+        EnvSnapshot { slots }
     }
 
     /// The logical Java frame this scope belongs to (§20.7).

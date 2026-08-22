@@ -46,9 +46,19 @@ pub enum ExecError {
     NullPointer,
 }
 
-/// Maximum call-stack depth before a StackOverflowError is raised (seam; increment 8 makes this a
-/// real Java exception and configurable). Kept modest so recursion fits a test-thread stack.
-const MAX_CALL_DEPTH: usize = 1500;
+/// Default guest call-stack limit, in frames.
+///
+/// The interpreter currently recurses on the **host** stack for each Java call, so this bound must
+/// keep the deepest guest recursion inside the host thread's stack. Measured worst case (a debug
+/// build on a default 2 MiB thread stack) is ~4 KiB of host stack per frame: 400 frames survive and
+/// 600 overflow, so the default leaves roughly a 1.5× margin. Without such a bound, deep guest
+/// recursion aborts the process with a host stack overflow instead of raising a Java
+/// `StackOverflowError` — silently trading a catchable error for a crash.
+///
+/// An embedder that runs guest code on a larger stack can raise this via
+/// [`Program::with_max_call_depth`]. The real fix is an explicit frame stack (an iterative
+/// interpreter), which increment 8 needs anyway for stack traces (§20.7).
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 256;
 
 /// A built class: every static method built once (unbuildable ones → `None`), plus a name→index
 /// map. `invokestatic` resolves against this table and recurses into the callee. Cross-class
@@ -59,6 +69,8 @@ pub struct Program {
     /// Type-appropriate zero values for this class's instance fields, in declaration order (JVMS
     /// default-value semantics: int→0, long→0L, float→0.0, double→0.0, reference→null).
     field_defaults: Vec<Val128>,
+    /// Guest call-stack limit for this program (see [`DEFAULT_MAX_CALL_DEPTH`]).
+    max_call_depth: usize,
 }
 
 /// The JVMS default value for a field of the given descriptor.
@@ -101,7 +113,15 @@ impl Program {
             methods,
             by_name,
             field_defaults,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
         }
+    }
+
+    /// Raise (or lower) the guest call-stack limit — only sound if guest code runs on a host thread
+    /// whose stack can hold that many frames (see [`DEFAULT_MAX_CALL_DEPTH`]).
+    pub fn with_max_call_depth(mut self, frames: usize) -> Self {
+        self.max_call_depth = frames;
+        self
     }
 
     /// Invoke a method by its class-table index; `None` = a `void` return.
@@ -160,7 +180,8 @@ fn run(
     logical: LogicalFrame,
     heap: &mut Heap,
 ) -> Result<Option<Val128>, ExecError> {
-    if depth > MAX_CALL_DEPTH {
+    let limit = program.map_or(DEFAULT_MAX_CALL_DEPTH, |p| p.max_call_depth);
+    if depth > limit {
         return Err(ExecError::StackOverflow);
     }
     if args.len() != built.arg_vals.len() {
@@ -1028,7 +1049,9 @@ public final class CallsOracle {
         for n in 0..=20 {
             cases.push(("fact", "(I)J", n, 0, 0, true));
         }
-        for n in [0, 1, 2, 3, 10, 50, 99, 100, 200, 300] {
+        for n in [0, 1, 2, 3, 10, 50, 99, 100, 200] {
+            // Depth ≈ n, kept inside DEFAULT_MAX_CALL_DEPTH; deeper mutual recursion is covered by
+            // `deep_recursion_needs_a_raised_limit_and_a_bigger_stack`.
             cases.push(("isEven", "(I)I", n, 0, 0, false));
             cases.push(("isOdd", "(I)I", n, 0, 0, false));
         }
@@ -1103,11 +1126,13 @@ public final class CallsOracle {
             return;
         }
         let bytes = std::fs::read(dir.join("Calls.class")).unwrap();
+        // Regression for a review finding: on a DEFAULT-sized host stack, unbounded guest recursion
+        // must return StackOverflow rather than abort the process with a host stack overflow. The
+        // thread is deliberately given the default stack size — no 64 MiB crutch.
         let result = std::thread::Builder::new()
-            .stack_size(64 << 20)
             .spawn(move || {
                 let cf = rjava_classfile::parse(&bytes).unwrap();
-                let program = Program::from_class(&cf);
+                let program = Program::from_class(&cf); // DEFAULT_MAX_CALL_DEPTH
                 program.call_named("deep", "(I)I", &[Val128::from_i32(0)])
             })
             .unwrap()
@@ -1119,6 +1144,50 @@ public final class CallsOracle {
             "unbounded recursion must raise StackOverflow, got {result:?}"
         );
         eprintln!("StackOverflow seam OK: deep(0) -> {result:?}");
+    }
+
+    /// The documented way to run guest code that recurses deeper than the safe-by-default limit:
+    /// give the host thread a bigger stack and raise the limit together. (Until the interpreter
+    /// uses an explicit frame stack, guest depth is bounded by host stack space.)
+    #[test]
+    fn deep_recursion_needs_a_raised_limit_and_a_bigger_stack() {
+        if !tool_ok("javac") {
+            eprintln!("skipping deep_recursion: javac unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Calls.java");
+        let dir = std::env::temp_dir().join(format!("rjava-deep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if !std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping deep_recursion: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Calls.class")).unwrap();
+        let got = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let cf = rjava_classfile::parse(&bytes).unwrap();
+                let program = Program::from_class(&cf).with_max_call_depth(4000);
+                // isEven(3000) recurses ~3000 frames — far past DEFAULT_MAX_CALL_DEPTH.
+                program
+                    .call_named("isEven", "(I)I", &[Val128::from_i32(3000)])
+                    .unwrap()
+                    .unwrap()
+                    .as_i32()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(got, 1, "isEven(3000) is true");
+        eprintln!("raised-limit deep recursion OK: isEven(3000) -> {got}");
     }
 
     /// Stack-φ conformance: native ternary `?:` (including nested) is lowered via φ over
