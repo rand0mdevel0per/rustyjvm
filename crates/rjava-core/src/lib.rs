@@ -18,7 +18,7 @@ pub mod lock;
 pub mod registry;
 pub mod value;
 
-pub use diff::{DiffNode, EnvSnapshot, EscapeState};
+pub use diff::{chains_conflict, DiffNode, EnvSnapshot, EscapeState, FieldKey, ForkRegistry};
 pub use env::{Env, LogicalFrame, MAX_SLOTS};
 pub use ids::{BlockId, ClassId, InternedName, LoaderId, RefIndex, RegistryKey, SlotId, VtId};
 pub use ir::{

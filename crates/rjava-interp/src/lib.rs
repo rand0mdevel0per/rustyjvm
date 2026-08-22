@@ -10,7 +10,8 @@
 //! results bit-identical to Corretto.
 
 use rjava_core::{
-    BlockId, ClassId, Env, EscapeState, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator, Val128,
+    BlockId, ClassId, Effect, Env, EscapeState, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator,
+    Val128,
 };
 use rjava_gc::Heap;
 use rjava_ir::BuiltMethod;
@@ -204,6 +205,11 @@ fn run(
         }
 
         for node in &block.nodes {
+            // `Effect::Extern` is a fence: it is never speculated and its predecessors land in
+            // program order before it runs (§10.6). Calls carry this effect.
+            if node.effect == Effect::Extern {
+                env.land();
+            }
             match node.op {
                 // Calls (need the Program + recursion + shared heap).
                 Op::InvokeStatic(index) | Op::InvokeSpecial(index) => {
@@ -282,6 +288,10 @@ fn run(
             }
             Terminator::Throw(_) => return Err(ExecError::Thrown),
         }
+        // End of chain: land this block's diff into the environment in program order (§10.5).
+        // Landing incrementally — rather than batching at scope exit — is what keeps intra-vt
+        // execution as-if-serial and makes the increment-8 po-truncation on a caught throw correct.
+        env.land();
     }
 }
 

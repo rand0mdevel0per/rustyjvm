@@ -12,7 +12,7 @@ pub struct ClassId(pub u32);
 
 /// Virtual-thread id; the unit of Java-level concurrency (§11.1). Diff trees of different tid
 /// never merge (§10.5).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub struct VtId(pub u32);
 
 /// Per-scope local/SSA slot index, range `0..1024` (§9.5).
