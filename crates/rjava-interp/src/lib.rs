@@ -249,9 +249,12 @@ fn leave_frame(
     }
 }
 
-/// Execute a built method over a fresh Env register file. `program` is needed only if the method
-/// contains `invokestatic`; `depth`/`logical` thread the call stack (StackOverflow seam + logical
-/// frames, §20.7).
+/// Execute a built method over a fresh Env register file, tearing the frame down on **every** exit.
+///
+/// `depth`/`logical` thread the call stack (StackOverflow seam + logical frames, §20.7). A frame
+/// that leaves abruptly must release what it owned just as a returning one does — otherwise a throw
+/// would leak its S1 handles and S2 references — so the teardown lives here, around the body,
+/// rather than at each `return`.
 #[allow(clippy::too_many_arguments)]
 fn run(
     program: &Program,
@@ -268,17 +271,45 @@ fn run(
     if args.len() != built.arg_vals.len() {
         return Err(ExecError::BadArgs);
     }
-    let mut env = Env::new(built.n_slots.max(1), logical);
+    let n_slots = built.n_slots.max(1);
+    let mut env = Env::new(n_slots, logical);
     for (slot, &value) in built.arg_vals.iter().zip(args) {
         env.write_slot(SlotId(slot.offset), value);
     }
+    let mut rc_buf: Vec<(RefIndex, i32)> = Vec::new();
 
+    let result = run_body(program, owner, built, depth, heap, &mut env, &mut rc_buf);
+
+    match result {
+        Ok(rv) => leave_frame(&mut env, heap, &mut rc_buf, n_slots, rv),
+        Err(_) => {
+            // An abrupt exit still owns whatever the frame allocated, so it is torn down exactly
+            // like a return, minus a value to hand over. The pending diff is landed rather than
+            // discarded: the frame is being destroyed, so its slots are unobservable either way,
+            // but teardown needs them to see which references to release — discarding first would
+            // orphan anything allocated in the chain that threw. (§20.5's program-order truncation
+            // is a property of a *handler* resuming, which arrives with exceptions in increment 8;
+            // it is not what happens when a frame is destroyed outright, §20.4.)
+            leave_frame(&mut env, heap, &mut rc_buf, n_slots, None);
+        }
+    }
+    result
+}
+
+/// The interpreter loop. Every exit — normal or abrupt — is torn down by [`run`].
+#[allow(clippy::too_many_arguments)]
+fn run_body(
+    program: &Program,
+    owner: ClassId,
+    built: &BuiltMethod,
+    depth: usize,
+    heap: &mut Heap,
+    env: &mut Env,
+    rc_buf: &mut Vec<(RefIndex, i32)>,
+) -> Result<Option<Val128>, ExecError> {
     let mut cur = built.method.entry;
     let mut prev: Option<BlockId> = None;
     let mut steps: u64 = 0;
-    // Reused across landings so the reference-count batches cost no allocation.
-    let mut rc_buf: Vec<(RefIndex, i32)> = Vec::new();
-    let n_slots = built.n_slots.max(1);
     loop {
         steps += 1;
         if steps > 100_000_000 {
@@ -313,7 +344,7 @@ fn run(
             // `Effect::Extern` is a fence: it is never speculated and its predecessors land in
             // program order before it runs (§10.6). Calls carry this effect.
             if node.effect == Effect::Extern {
-                land_chain(&mut env, heap, &mut rc_buf);
+                land_chain(env, heap, rc_buf);
             }
             match node.op {
                 // Calls (need the Program + recursion + shared heap).
@@ -512,15 +543,8 @@ fn run(
         }
 
         match &block.term {
-            Terminator::Return(Some(v)) => {
-                let rv = env.read_slot(SlotId(v.offset));
-                leave_frame(&mut env, heap, &mut rc_buf, n_slots, Some(rv));
-                return Ok(Some(rv));
-            }
-            Terminator::Return(None) => {
-                leave_frame(&mut env, heap, &mut rc_buf, n_slots, None);
-                return Ok(None);
-            }
+            Terminator::Return(Some(v)) => return Ok(Some(env.read_slot(SlotId(v.offset)))),
+            Terminator::Return(None) => return Ok(None),
             Terminator::Goto(b) => {
                 prev = Some(cur);
                 cur = *b;
@@ -539,7 +563,7 @@ fn run(
         // End of chain: land this block's diff into the environment in program order (§10.5).
         // Landing incrementally — rather than batching at scope exit — is what keeps intra-vt
         // execution as-if-serial and makes the increment-8 po-truncation on a caught throw correct.
-        land_chain(&mut env, heap, &mut rc_buf);
+        land_chain(env, heap, rc_buf);
     }
 }
 
@@ -2040,5 +2064,62 @@ public final class ShapesOracle {
             "hierarchy differential OK: {} cases match Corretto 21",
             cases.len()
         );
+    }
+
+    /// Regression for a review finding: a frame that leaves **abruptly** must release what it
+    /// owned, just as a returning frame does. Otherwise a throw leaks its S1 handles and S2
+    /// references, and a reused bounded heap is exhausted by repeating the same call.
+    #[test]
+    fn an_abrupt_exit_releases_the_frames_references() {
+        if !tool_ok("javac") {
+            eprintln!("skipping abrupt-exit test: javac unavailable");
+            return;
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/java/Abrupt.java");
+        let dir = std::env::temp_dir().join(format!("rjava-abrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if !std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping abrupt-exit test: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Abrupt.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+        let idx = program
+            .method_index("throwsAfterAllocating", "(I)I")
+            .expect("method present");
+
+        // A heap just big enough for one call's two objects: if the failed call kept them, the
+        // second call would fail with OutOfMemory instead of the same NullPointer.
+        let mut heap = Heap::with_limit(2);
+        for attempt in 1..=5 {
+            let r = program.call(
+                program.entry,
+                idx,
+                &[Val128::from_i32(attempt)],
+                0,
+                &mut heap,
+            );
+            assert_eq!(
+                r,
+                Err(ExecError::NullPointer),
+                "attempt {attempt} should fail on the null receiver, not run out of heap"
+            );
+            assert_eq!(
+                heap.live(),
+                0,
+                "attempt {attempt} leaked {} objects out of an abruptly-exited frame",
+                heap.live()
+            );
+        }
+        eprintln!("abrupt-exit teardown OK: 5 failed calls on a 2-object heap, nothing retained");
     }
 }
