@@ -79,11 +79,18 @@ fn parse_field_type(b: &[u8], mut i: usize) -> Result<(VType, usize), VerifyErro
 }
 
 /// The verification type of a single field descriptor (JVMS §4.3.2), e.g. `I` or `LPoint;`.
+/// The whole string must be consumed — trailing bytes make the descriptor malformed.
 pub fn parse_field_descriptor(desc: &str) -> Result<VType, VerifyError> {
-    parse_field_type(desc.as_bytes(), 0).map(|(t, _)| t)
+    let b = desc.as_bytes();
+    let (t, end) = parse_field_type(b, 0)?;
+    if end != b.len() {
+        return Err(VerifyError::BadDescriptor);
+    }
+    Ok(t)
 }
 
-/// Parse a method descriptor into its argument types and return type (`None` = `void`).
+/// Parse a method descriptor into its argument types and return type (`None` = `void`). The whole
+/// string must be consumed — trailing bytes make the descriptor malformed.
 pub fn parse_method_descriptor(desc: &str) -> Result<(Vec<VType>, Option<VType>), VerifyError> {
     let b = desc.as_bytes();
     if b.first() != Some(&b'(') {
@@ -97,11 +104,15 @@ pub fn parse_method_descriptor(desc: &str) -> Result<(Vec<VType>, Option<VType>)
         i = ni;
     }
     i += 1; // past ')'
-    let ret = if b.get(i) == Some(&b'V') {
-        None
+    let (ret, end) = if b.get(i) == Some(&b'V') {
+        (None, i + 1)
     } else {
-        Some(parse_field_type(b, i)?.0)
+        let (t, ni) = parse_field_type(b, i)?;
+        (Some(t), ni)
     };
+    if end != b.len() {
+        return Err(VerifyError::BadDescriptor);
+    }
     Ok((args, ret))
 }
 
@@ -125,6 +136,35 @@ mod tests {
         assert_eq!(args, vec![VType::Reference, VType::Reference, VType::Long]);
         assert_eq!(ret, None);
         assert!(parse_method_descriptor("nonsense").is_err());
+    }
+
+    #[test]
+    fn descriptors_reject_trailing_bytes() {
+        // Regression for a review finding: a descriptor must consume its whole string, otherwise a
+        // malformed one is silently accepted with a different shape than its bytes declare.
+        for bad in ["Iextra", "LFoo;;", "[Ix", ""] {
+            assert_eq!(
+                parse_field_descriptor(bad),
+                Err(VerifyError::BadDescriptor),
+                "field descriptor {bad:?} must be rejected"
+            );
+        }
+        for bad in ["()Vjunk", "(I)II", "(I)Vx", "(I)", "()Ljava/lang/String;x"] {
+            assert_eq!(
+                parse_method_descriptor(bad),
+                Err(VerifyError::BadDescriptor),
+                "method descriptor {bad:?} must be rejected"
+            );
+        }
+        // Well-formed descriptors still parse.
+        assert_eq!(parse_field_descriptor("I").unwrap(), VType::Int);
+        assert_eq!(parse_field_descriptor("[[J").unwrap(), VType::Reference);
+        assert_eq!(parse_field_descriptor("LPoint;").unwrap(), VType::Reference);
+        assert_eq!(parse_method_descriptor("()V").unwrap(), (vec![], None));
+        assert_eq!(
+            parse_method_descriptor("(I)Ljava/lang/String;").unwrap(),
+            (vec![VType::Int], Some(VType::Reference))
+        );
     }
 
     #[test]

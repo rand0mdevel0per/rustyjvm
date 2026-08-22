@@ -172,7 +172,25 @@ impl ConstantPool {
     }
 }
 
+/// A MUTF-8 continuation byte must be `10xxxxxx`.
+#[inline]
+fn cont(bytes: &[u8], i: usize) -> Result<u32, ClassFileError> {
+    let b = *bytes.get(i).ok_or(ClassFileError::BadUtf8)?;
+    if b & 0xC0 != 0x80 {
+        return Err(ClassFileError::BadUtf8);
+    }
+    Ok((b & 0x3F) as u32)
+}
+
 /// Decode modified UTF-8 (JVMS §4.4.7) into a Rust `String`.
+///
+/// Validation is strict — a class file is untrusted input (§7.1), so a malformed constant must be
+/// rejected rather than silently decoded into a string a conforming JVM would never produce:
+/// continuation bytes must be `10xxxxxx`, and overlong encodings are refused (with the single
+/// MUTF-8-mandated exception `C0 80`, which encodes NUL).
+///
+/// Note: MUTF-8 can encode an unpaired surrogate, which a Java `String` (UTF-16) can hold but a
+/// Rust `String` cannot. Such input is rejected rather than lossily substituted.
 fn decode_mutf8(bytes: &[u8]) -> Result<String, ClassFileError> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -185,28 +203,27 @@ fn decode_mutf8(bytes: &[u8]) -> Result<String, ClassFileError> {
             out.push(b as char);
             i += 1;
         } else if b & 0xE0 == 0xC0 {
-            // 2-byte form (also encodes NUL as 0xC0 0x80).
-            let b2 = *bytes.get(i + 1).ok_or(ClassFileError::BadUtf8)?;
-            let cp = (((b & 0x1F) as u32) << 6) | ((b2 & 0x3F) as u32);
+            // 2-byte form. `C0 80` is MUTF-8's NUL; every other sub-0x80 result is overlong.
+            let cp = (((b & 0x1F) as u32) << 6) | cont(bytes, i + 1)?;
+            if cp < 0x80 && !(b == 0xC0 && bytes[i + 1] == 0x80) {
+                return Err(ClassFileError::BadUtf8);
+            }
             out.push(char::from_u32(cp).ok_or(ClassFileError::BadUtf8)?);
             i += 2;
         } else if b & 0xF0 == 0xE0 {
             // 3-byte form; a supplementary character is a surrogate pair of two 3-byte forms.
-            let b2 = *bytes.get(i + 1).ok_or(ClassFileError::BadUtf8)?;
-            let b3 = *bytes.get(i + 2).ok_or(ClassFileError::BadUtf8)?;
-            let cp =
-                (((b & 0x0F) as u32) << 12) | (((b2 & 0x3F) as u32) << 6) | ((b3 & 0x3F) as u32);
+            let cp = (((b & 0x0F) as u32) << 12) | (cont(bytes, i + 1)? << 6) | cont(bytes, i + 2)?;
+            if cp < 0x800 {
+                return Err(ClassFileError::BadUtf8); // overlong
+            }
             if (0xD800..=0xDBFF).contains(&cp) {
                 // High surrogate: consume the following 3-byte low surrogate and combine.
                 let c4 = *bytes.get(i + 3).ok_or(ClassFileError::BadUtf8)?;
-                let c5 = *bytes.get(i + 4).ok_or(ClassFileError::BadUtf8)?;
-                let c6 = *bytes.get(i + 5).ok_or(ClassFileError::BadUtf8)?;
                 if c4 & 0xF0 != 0xE0 {
                     return Err(ClassFileError::BadUtf8);
                 }
-                let lo = (((c4 & 0x0F) as u32) << 12)
-                    | (((c5 & 0x3F) as u32) << 6)
-                    | ((c6 & 0x3F) as u32);
+                let lo =
+                    (((c4 & 0x0F) as u32) << 12) | (cont(bytes, i + 4)? << 6) | cont(bytes, i + 5)?;
                 if !(0xDC00..=0xDFFF).contains(&lo) {
                     return Err(ClassFileError::BadUtf8);
                 }
@@ -214,6 +231,7 @@ fn decode_mutf8(bytes: &[u8]) -> Result<String, ClassFileError> {
                 out.push(char::from_u32(combined).ok_or(ClassFileError::BadUtf8)?);
                 i += 6;
             } else {
+                // Rejects an unpaired low surrogate (not representable in a Rust `String`).
                 out.push(char::from_u32(cp).ok_or(ClassFileError::BadUtf8)?);
                 i += 3;
             }
@@ -236,5 +254,40 @@ mod tests {
         assert_eq!(decode_mutf8(&[0xC0, 0x80]).unwrap(), "\0");
         // A bare NUL byte is invalid.
         assert_eq!(decode_mutf8(&[0x00]), Err(ClassFileError::BadUtf8));
+    }
+
+    #[test]
+    fn mutf8_valid_multibyte_roundtrips() {
+        // 2-byte (U+00E9 é), 3-byte (U+4E2D 中), and a surrogate pair (U+1F600 😀).
+        assert_eq!(decode_mutf8(&[0xC3, 0xA9]).unwrap(), "é");
+        assert_eq!(decode_mutf8(&[0xE4, 0xB8, 0xAD]).unwrap(), "中");
+        assert_eq!(
+            decode_mutf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap(),
+            "😀"
+        );
+    }
+
+    #[test]
+    fn mutf8_rejects_malformed_and_overlong() {
+        // Regression for a review finding: continuation bytes must be 10xxxxxx, and overlong
+        // encodings are forbidden (except the mandated C0 80 NUL). A class file is untrusted
+        // input, so these must be rejected, not silently decoded (§7.1).
+        for bad in [
+            &[0xC2, 0x41][..],             // 2-byte: second byte is not a continuation
+            &[0xE1, 0x41, 0x42][..],       // 3-byte: neither trailing byte is a continuation
+            &[0xC0, 0x81][..],             // overlong 2-byte (only C0 80 is allowed)
+            &[0xE0, 0x80, 0x81][..],       // overlong 3-byte
+            &[0xC1, 0xBF][..],             // overlong 2-byte encoding of 0x7F
+            &[0xF0, 0x9F, 0x98, 0x80][..], // 4-byte UTF-8 is not valid MUTF-8
+            &[0xED, 0xB8, 0x80][..],       // unpaired low surrogate
+            &[0xED, 0xA0, 0xBD][..],       // unpaired high surrogate (truncated pair)
+            &[0x80][..],                   // stray continuation byte
+        ] {
+            assert_eq!(
+                decode_mutf8(bad),
+                Err(ClassFileError::BadUtf8),
+                "must reject {bad:02X?}"
+            );
+        }
     }
 }

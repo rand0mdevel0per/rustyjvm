@@ -164,9 +164,15 @@ fn resolve_field(cf: &ClassFile, cpidx: u16, pc: u32) -> Result<(u16, Tag), IrEr
     Err(IrError::Unsupported { op: 0xb4, pc })
 }
 
-/// Resolve `invokespecial`: `Some(method index)` for a same-class instance method (`<init>`), or
 #[allow(clippy::type_complexity)]
-/// `None` for a cross-class no-op (e.g. `Object.<init>`; void only in increment 3).
+/// Resolve `invokespecial`: `Some(method index)` for a same-class instance method, or `None` for
+/// the one cross-class call that is genuinely a no-op — `java/lang/Object.<init>()V`, which has no
+/// observable effect.
+///
+/// Any *other* cross-class `invokespecial` (a real superclass constructor, which may write fields)
+/// is rejected as unsupported rather than silently dropped: no-op'ing it would leave the object
+/// partially initialised and produce silently wrong results. Real superclass calls arrive with the
+/// loader in increment 6 (§8).
 fn resolve_invokespecial(
     cf: &ClassFile,
     cpidx: u16,
@@ -190,23 +196,25 @@ fn resolve_invokespecial(
     let desc = cp
         .utf8(desc_index)
         .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
+    let name = cp
+        .utf8(name_index)
+        .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
     let (arg_ty, ret_ty) =
         parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb7, pc })?;
     if cp.class_name(class_index) == cf.this_class_name() {
-        let name = cp
-            .utf8(name_index)
-            .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
         let mindex = cf
             .methods
             .iter()
             .position(|m| m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc))
             .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
         Ok((Some(mindex as u16), arg_ty, ret_ty))
+    } else if cp.class_name(class_index) == Some("java/lang/Object")
+        && name == "<init>"
+        && desc == "()V"
+    {
+        Ok((None, arg_ty, ret_ty)) // the only effect-free cross-class constructor
     } else {
-        if ret_ty.is_some() {
-            return Err(IrError::Unsupported { op: 0xb7, pc }); // cross-class non-void: increment 6
-        }
-        Ok((None, arg_ty, ret_ty))
+        Err(IrError::Unsupported { op: 0xb7, pc })
     }
 }
 
@@ -1044,5 +1052,32 @@ mod tests {
             "loop header should have φ for s and i, got {total_phis}"
         );
         assert_eq!(built.arg_vals.len(), 1); // n
+    }
+
+    /// Regression for a review finding: a genuine superclass constructor writes fields, so its
+    /// cross-class `invokespecial` must be rejected rather than no-op'd (which would leave the
+    /// object partially initialised and silently produce wrong results). Real superclass calls
+    /// arrive with the loader in increment 6.
+    #[test]
+    fn superclass_constructor_is_rejected_not_silently_dropped() {
+        let Some(bytes) = compile("Sub") else {
+            eprintln!("skipping superclass_constructor test: javac unavailable");
+            return;
+        };
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let init = cf.method("<init>", "()V").expect("Sub.<init>");
+        let vm = rjava_verify::verify_method(&cf, init).expect("verifies");
+        assert!(
+            matches!(build(&vm, &cf), Err(IrError::Unsupported { op: 0xb7, .. })),
+            "cross-class super() must be unsupported, never a silent no-op"
+        );
+        // The effect-free `Object.<init>()V` case still builds (Point-style classes).
+        let Some(pbytes) = compile("Point") else {
+            return;
+        };
+        let pcf = rjava_classfile::parse(&pbytes).unwrap();
+        let pinit = pcf.method("<init>", "()V").unwrap();
+        let pvm = rjava_verify::verify_method(&pcf, pinit).unwrap();
+        assert!(build(&pvm, &pcf).is_ok(), "Object.<init> stays a no-op");
     }
 }
