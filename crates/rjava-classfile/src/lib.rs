@@ -125,6 +125,13 @@ pub fn parse(data: &[u8]) -> Result<ClassFile, ClassFileError> {
     let fields = parse_members(&mut r, &constant_pool)?;
     let methods = parse_members(&mut r, &constant_pool)?;
     let attributes = parse_attributes(&mut r, &constant_pool)?;
+    // A class file ends after its attribute table (JVMS §4.1). Trailing bytes mean the input is not
+    // a well-formed class file — reject rather than silently ignoring whatever follows.
+    if r.remaining() != 0 {
+        return Err(ClassFileError::BadAttribute(
+            "trailing bytes after the class file",
+        ));
+    }
     Ok(ClassFile {
         minor,
         major,
@@ -193,6 +200,23 @@ mod tests {
                 .iter()
                 .any(|a| a.raw_named(&cf.constant_pool, "StackMapTable").is_some()),
             "StackMapTable retained in Code attributes"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_the_class_file() {
+        // Regression for a review finding: a class file ends after its attribute table (JVMS §4.1),
+        // so anything appended makes the input malformed.
+        let Some(bytes) = compile_slice() else {
+            eprintln!("skipping trailing-bytes test: javac unavailable");
+            return;
+        };
+        parse(&bytes).expect("the unmodified class parses");
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(b"junk");
+        assert!(
+            matches!(parse(&padded), Err(ClassFileError::BadAttribute(_))),
+            "trailing bytes must be rejected"
         );
     }
 
