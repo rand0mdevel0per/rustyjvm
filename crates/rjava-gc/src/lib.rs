@@ -30,7 +30,12 @@ pub struct Heap {
 impl Heap {
     /// A heap that can hold up to `limit` simultaneously-live objects before allocation fails.
     pub fn with_limit(limit: usize) -> Self {
-        Heap { slots: Vec::new(), free: Vec::new(), live: 0, limit }
+        Heap {
+            slots: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            limit,
+        }
     }
 
     /// A heap with a generous default limit.
@@ -38,18 +43,24 @@ impl Heap {
         Heap::with_limit(1 << 24)
     }
 
-    /// Allocate a fresh object with `n_fields` `null`-initialised fields. Returns its [`RefIndex`],
-    /// or `None` when the live-object watermark is reached (allocation failure, §22.1).
+    /// Allocate a fresh object with the given (type-appropriate zero) field values. Returns its
+    /// [`RefIndex`], or `None` when the live-object watermark is reached (allocation failure,
+    /// §22.1). The caller supplies typed zeros (int→0, long→0L, float→0.0, ref→null) per JVMS
+    /// default-value semantics.
     pub fn alloc(
         &mut self,
         class: ClassId,
         escape: EscapeState,
-        n_fields: usize,
+        fields: Vec<Val128>,
     ) -> Option<RefIndex> {
         if self.live >= self.limit {
             return None;
         }
-        let obj = Object { class, escape, fields: vec![Val128::null(); n_fields] };
+        let obj = Object {
+            class,
+            escape,
+            fields,
+        };
         let idx = if let Some(i) = self.free.pop() {
             self.slots[i as usize] = Some(obj);
             i
@@ -115,7 +126,9 @@ mod tests {
     #[test]
     fn alloc_fields_get_set() {
         let mut h = Heap::new();
-        let r = h.alloc(ClassId(7), EscapeState::S1, 3).unwrap();
+        let r = h
+            .alloc(ClassId(7), EscapeState::S1, vec![Val128::null(); 3])
+            .unwrap();
         // Fields start as null.
         assert_eq!(h.get_field(r, 0).unwrap(), Val128::null());
         assert!(h.set_field(r, 1, Val128::from_i32(42)));
@@ -130,14 +143,20 @@ mod tests {
     #[test]
     fn free_recycles_index_and_tracks_live() {
         let mut h = Heap::new();
-        let a = h.alloc(ClassId(0), EscapeState::S1, 1).unwrap();
-        let _b = h.alloc(ClassId(0), EscapeState::S1, 1).unwrap();
+        let a = h
+            .alloc(ClassId(0), EscapeState::S1, vec![Val128::null(); 1])
+            .unwrap();
+        let _b = h
+            .alloc(ClassId(0), EscapeState::S1, vec![Val128::null(); 1])
+            .unwrap();
         assert_eq!(h.live(), 2);
         h.free(a);
         assert_eq!(h.live(), 1);
         assert!(h.get(a).is_none());
         // The freed index is reused by the next allocation.
-        let c = h.alloc(ClassId(0), EscapeState::S1, 1).unwrap();
+        let c = h
+            .alloc(ClassId(0), EscapeState::S1, vec![Val128::null(); 1])
+            .unwrap();
         assert_eq!(c, a);
         assert_eq!(h.live(), 2);
     }
@@ -146,8 +165,8 @@ mod tests {
     fn allocation_fails_at_the_watermark() {
         // §22.1: a failed allocation returns None (surfaced later as OutOfMemoryError).
         let mut h = Heap::with_limit(2);
-        assert!(h.alloc(ClassId(0), EscapeState::S1, 0).is_some());
-        assert!(h.alloc(ClassId(0), EscapeState::S1, 0).is_some());
-        assert!(h.alloc(ClassId(0), EscapeState::S1, 0).is_none());
+        assert!(h.alloc(ClassId(0), EscapeState::S1, Vec::new()).is_some());
+        assert!(h.alloc(ClassId(0), EscapeState::S1, Vec::new()).is_some());
+        assert!(h.alloc(ClassId(0), EscapeState::S1, Vec::new()).is_none());
     }
 }

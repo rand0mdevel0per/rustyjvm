@@ -9,7 +9,10 @@
 //! match the JVM's `iadd`/`ldiv`/`f2i`/… semantics exactly, which is what makes the differential
 //! results bit-identical to Corretto.
 
-use rjava_core::{BlockId, Env, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator, Val128};
+use rjava_core::{
+    BlockId, ClassId, Env, EscapeState, IntCond, LogicalFrame, Op, SlotId, Tag, Terminator, Val128,
+};
+use rjava_gc::Heap;
 use rjava_ir::BuiltMethod;
 
 /// A runtime failure. Increment 1 cannot yet raise Java exceptions (those arrive in increment 8);
@@ -36,6 +39,10 @@ pub enum ExecError {
     StackOverflow,
     #[error("no such method, or the callee failed to build")]
     NoMethod,
+    #[error("out of memory (allocation failed, §22.1)")]
+    OutOfMemory,
+    #[error("null pointer (NullPointerException, implemented in increment 8)")]
+    NullPointer,
 }
 
 /// Maximum call-stack depth before a StackOverflowError is raised (seam; increment 8 makes this a
@@ -48,6 +55,20 @@ const MAX_CALL_DEPTH: usize = 1500;
 pub struct Program {
     methods: Vec<Option<BuiltMethod>>,
     by_name: std::collections::HashMap<(String, String), u16>,
+    /// Type-appropriate zero values for this class's instance fields, in declaration order (JVMS
+    /// default-value semantics: int→0, long→0L, float→0.0, double→0.0, reference→null).
+    field_defaults: Vec<Val128>,
+}
+
+/// The JVMS default value for a field of the given descriptor.
+fn field_default(desc: Option<&str>) -> Val128 {
+    match desc.and_then(|d| d.as_bytes().first()) {
+        Some(b'J') => Val128::from_i64(0),
+        Some(b'F') => Val128::from_f32(0.0),
+        Some(b'D') => Val128::from_f64(0.0),
+        Some(b'L') | Some(b'[') => Val128::null(),
+        _ => Val128::from_i32(0), // B, C, I, S, Z
+    }
 }
 
 impl Program {
@@ -69,7 +90,17 @@ impl Program {
                     .and_then(|vm| rjava_ir::build(&vm, cf).ok())
             })
             .collect();
-        Program { methods, by_name }
+        let field_defaults = cf
+            .fields
+            .iter()
+            .filter(|m| m.access_flags & 0x0008 == 0) // instance (non-static) fields
+            .map(|m| field_default(m.descriptor(&cf.constant_pool)))
+            .collect();
+        Program {
+            methods,
+            by_name,
+            field_defaults,
+        }
     }
 
     /// Invoke a method by its class-table index; `None` = a `void` return.
@@ -78,13 +109,21 @@ impl Program {
         index: u16,
         args: &[Val128],
         depth: usize,
+        heap: &mut Heap,
     ) -> Result<Option<Val128>, ExecError> {
         let built = self
             .methods
             .get(index as usize)
             .and_then(Option::as_ref)
             .ok_or(ExecError::NoMethod)?;
-        run(Some(self), built, args, depth, LogicalFrame(index as u32))
+        run(
+            Some(self),
+            built,
+            args,
+            depth,
+            LogicalFrame(index as u32),
+            heap,
+        )
     }
 
     /// Invoke a method by name + descriptor (the launcher/test entry point).
@@ -98,13 +137,15 @@ impl Program {
             .by_name
             .get(&(name.to_string(), desc.to_string()))
             .ok_or(ExecError::NoMethod)?;
-        self.call(idx, args, 0)
+        let mut heap = Heap::new();
+        self.call(idx, args, 0, &mut heap)
     }
 }
 
 /// Execute a call-free built method (increment 1/2a entry point).
 pub fn execute(built: &BuiltMethod, args: &[Val128]) -> Result<Val128, ExecError> {
-    run(None, built, args, 0, LogicalFrame(0))?.ok_or(ExecError::BadValue)
+    let mut heap = Heap::new();
+    run(None, built, args, 0, LogicalFrame(0), &mut heap)?.ok_or(ExecError::BadValue)
 }
 
 /// Execute a built method over a fresh Env register file. `program` is needed only if the method
@@ -116,6 +157,7 @@ fn run(
     args: &[Val128],
     depth: usize,
     logical: LogicalFrame,
+    heap: &mut Heap,
 ) -> Result<Option<Val128>, ExecError> {
     if depth > MAX_CALL_DEPTH {
         return Err(ExecError::StackOverflow);
@@ -162,23 +204,64 @@ fn run(
         }
 
         for node in &block.nodes {
-            if let Op::InvokeStatic(index) = node.op {
-                let prog = program.ok_or(ExecError::UnsupportedOp)?;
-                let mut argv: smallvec::SmallVec<[Val128; 4]> = smallvec::SmallVec::new();
-                for v in &node.ins {
-                    argv.push(env.read_slot(SlotId(v.offset)));
+            match node.op {
+                // Calls (need the Program + recursion + shared heap).
+                Op::InvokeStatic(index) | Op::InvokeSpecial(index) => {
+                    let prog = program.ok_or(ExecError::UnsupportedOp)?;
+                    let mut argv: smallvec::SmallVec<[Val128; 4]> = smallvec::SmallVec::new();
+                    for v in &node.ins {
+                        argv.push(env.read_slot(SlotId(v.offset)));
+                    }
+                    if let Some(r) = prog.call(index, &argv, depth + 1, heap)? {
+                        env.write_slot(SlotId(node.id.offset), r);
+                    }
                 }
-                if let Some(r) = prog.call(index, &argv, depth + 1)? {
-                    env.write_slot(SlotId(node.id.offset), r);
+                // Heap operations.
+                Op::New { escape, .. } => {
+                    let prog = program.ok_or(ExecError::UnsupportedOp)?;
+                    let r = heap
+                        .alloc(ClassId(0), escape, prog.field_defaults.clone())
+                        .ok_or(ExecError::OutOfMemory)?;
+                    let v = if escape == EscapeState::S1 {
+                        Val128::handle(r)
+                    } else {
+                        Val128::ptr(r)
+                    };
+                    env.write_slot(SlotId(node.id.offset), v);
                 }
-                continue;
+                Op::GetField(idx) => {
+                    let obj =
+                        env.read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
+                    if obj.tag() == Tag::Null {
+                        return Err(ExecError::NullPointer);
+                    }
+                    let v = heap
+                        .get_field(obj.ref_index(), idx as usize)
+                        .ok_or(ExecError::BadValue)?;
+                    env.write_slot(SlotId(node.id.offset), v);
+                }
+                Op::PutField(idx) => {
+                    let obj =
+                        env.read_slot(SlotId(node.ins.first().ok_or(ExecError::BadValue)?.offset));
+                    let val =
+                        env.read_slot(SlotId(node.ins.get(1).ok_or(ExecError::BadValue)?.offset));
+                    if obj.tag() == Tag::Null {
+                        return Err(ExecError::NullPointer);
+                    }
+                    if !heap.set_field(obj.ref_index(), idx as usize, val) {
+                        return Err(ExecError::BadValue);
+                    }
+                }
+                // Pure computations.
+                _ => {
+                    let mut inputs: smallvec::SmallVec<[Val128; 3]> = smallvec::SmallVec::new();
+                    for v in &node.ins {
+                        inputs.push(env.read_slot(SlotId(v.offset)));
+                    }
+                    let result = eval(node.op, node.ty, &inputs)?;
+                    env.write_slot(SlotId(node.id.offset), result);
+                }
             }
-            let mut inputs: smallvec::SmallVec<[Val128; 3]> = smallvec::SmallVec::new();
-            for v in &node.ins {
-                inputs.push(env.read_slot(SlotId(v.offset)));
-            }
-            let result = eval(node.op, node.ty, &inputs)?;
-            env.write_slot(SlotId(node.id.offset), result);
         }
 
         match &block.term {
@@ -261,8 +344,12 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
                 _ => return Err(ExecError::UnsupportedOp),
             }
         }
-        // Calls are dispatched in `run` (they need the Program + recursion), never here.
-        Op::InvokeStatic(_) => return Err(ExecError::UnsupportedOp),
+        // Calls and heap ops are dispatched in `run` (they need the Program/heap), never here.
+        Op::InvokeStatic(_)
+        | Op::InvokeSpecial(_)
+        | Op::New { .. }
+        | Op::GetField(_)
+        | Op::PutField(_) => return Err(ExecError::UnsupportedOp),
     })
 }
 
@@ -1266,6 +1353,127 @@ public final class MixedOracle {
         }
         eprintln!(
             "mixed (interaction) differential OK: {} cases match Corretto 21",
+            cases.len()
+        );
+    }
+
+    /// Increment-3 conformance gate: `new`/getfield/putfield/invokespecial on local (S1) objects,
+    /// including objects mutated in a loop; every result must match Corretto 21.
+    #[test]
+    fn differential_objects_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_objects: JDK unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Point.java");
+        let dir = std::env::temp_dir().join(format!("rjava-obj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = r#"
+import java.io.*;
+public final class PointOracle {
+    public static void main(String[] x) throws Exception {
+        var br = new BufferedReader(new InputStreamReader(System.in));
+        var sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.isEmpty()) continue;
+            String[] p = line.split("\\s+");
+            int a = p.length > 1 ? Integer.parseInt(p[1]) : 0;
+            int b = p.length > 2 ? Integer.parseInt(p[2]) : 0;
+            int c = p.length > 3 ? Integer.parseInt(p[3]) : 0;
+            int d = p.length > 4 ? Integer.parseInt(p[4]) : 0;
+            int r;
+            switch (p[0]) {
+                case "normSq": r = Point.normSq(a, b); break;
+                case "manhattan": r = Point.manhattan(a, b, c, d); break;
+                case "defaults": r = Point.defaults(); break;
+                case "accumulate": r = Point.accumulate(a); break;
+                default: r = 0;
+            }
+            sb.append(r).append('\n');
+        }
+        System.out.print(sb);
+    }
+}
+"#;
+        std::fs::write(dir.join("PointOracle.java"), oracle).unwrap();
+        let compiled = std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("PointOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !compiled {
+            eprintln!("skipping differential_objects: javac cannot target --release 21");
+            return;
+        }
+        let bytes = std::fs::read(dir.join("Point.class")).unwrap();
+        let cf = rjava_classfile::parse(&bytes).unwrap();
+        let program = Program::from_class(&cf);
+
+        // (method, descriptor, a, b, c, d)
+        let mut cases: Vec<(&str, &str, i32, i32, i32, i32)> = Vec::new();
+        cases.push(("defaults", "()I", 0, 0, 0, 0));
+        for (a, b) in [
+            (3, 4),
+            (0, 0),
+            (-5, 12),
+            (i32::MAX, 1),
+            (46340, 46340),
+            (-7, -8),
+        ] {
+            cases.push(("normSq", "(II)I", a, b, 0, 0));
+        }
+        for (a, b, c, d) in [
+            (0, 0, 3, 4),
+            (1, 1, -1, -1),
+            (10, 20, 30, 40),
+            (i32::MIN, 0, 0, 0),
+            (-5, 5, 5, -5),
+        ] {
+            cases.push(("manhattan", "(IIII)I", a, b, c, d));
+        }
+        for n in [0, 1, 2, 5, 10, 100, 1000] {
+            cases.push(("accumulate", "(I)I", n, 0, 0, 0));
+        }
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(m, _, a, b, c, d)| format!("{m} {a} {b} {c} {d}"))
+            .collect();
+        let Some(oracle_results) = run_named_oracle(&dir, "PointOracle", &lines) else {
+            eprintln!("skipping differential_objects: could not run the oracle");
+            return;
+        };
+        assert_eq!(oracle_results.len(), cases.len());
+
+        for ((m, desc, a, b, c, d), &expected) in cases.iter().zip(&oracle_results) {
+            let args: Vec<Val128> = match *desc {
+                "()I" => vec![],
+                "(I)I" => vec![Val128::from_i32(*a)],
+                "(II)I" => vec![Val128::from_i32(*a), Val128::from_i32(*b)],
+                _ => vec![
+                    Val128::from_i32(*a),
+                    Val128::from_i32(*b),
+                    Val128::from_i32(*c),
+                    Val128::from_i32(*d),
+                ],
+            };
+            let r = program
+                .call_named(m, desc, &args)
+                .unwrap_or_else(|e| panic!("{m}({a},{b},{c},{d}) failed: {e:?}"))
+                .expect("non-void return")
+                .as_i32() as i64;
+            assert_eq!(
+                r, expected,
+                "{m}({a}, {b}, {c}, {d}) diverged from Corretto 21"
+            );
+        }
+        eprintln!(
+            "objects differential OK: {} cases match Corretto 21",
             cases.len()
         );
     }

@@ -14,7 +14,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rjava_classfile::{ClassFile, Constant, ConstantPool};
 use rjava_core::{
-    Block, BlockId, Effect, IntCond, Method, Node, Op, Phi, Tag, Terminator, Val128, ValId,
+    Block, BlockId, Effect, EscapeState, IntCond, Method, Node, Op, Phi, Tag, Terminator, Val128,
+    ValId,
 };
 use rjava_verify::{parse_method_descriptor, Insn, VType, VerifiedMethod};
 use smallvec::{smallvec, SmallVec};
@@ -103,6 +104,110 @@ fn resolve_invokestatic(
     let (arg_ty, ret_ty) =
         parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb8, pc })?;
     Ok((mindex as u16, arg_ty, ret_ty))
+}
+
+fn instance_field_count(cf: &ClassFile) -> u16 {
+    cf.fields
+        .iter()
+        .filter(|m| m.access_flags & 0x0008 == 0)
+        .count() as u16
+}
+
+fn field_tag(desc: &str, pc: u32) -> Result<Tag, IrError> {
+    Ok(match desc.as_bytes().first() {
+        Some(b'B' | b'C' | b'I' | b'S' | b'Z') => Tag::I32,
+        Some(b'J') => Tag::I64,
+        Some(b'F') => Tag::F32,
+        Some(b'D') => Tag::F64,
+        Some(b'L' | b'[') => Tag::Ptr,
+        _ => return Err(IrError::Unsupported { op: 0xb4, pc }),
+    })
+}
+
+/// Resolve a same-class instance-field ref to (field index, field type). Cross-class fields await
+/// the loader (increment 6).
+fn resolve_field(cf: &ClassFile, cpidx: u16, pc: u32) -> Result<(u16, Tag), IrError> {
+    let cp = &cf.constant_pool;
+    let (class_index, nat) = match cp.get(cpidx) {
+        Some(Constant::FieldRef {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => return Err(IrError::Unsupported { op: 0xb4, pc }),
+    };
+    if cp.class_name(class_index) != cf.this_class_name() {
+        return Err(IrError::Unsupported { op: 0xb4, pc });
+    }
+    let (name_index, desc_index) = match cp.get(nat) {
+        Some(Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        }) => (*name_index, *descriptor_index),
+        _ => return Err(IrError::Unsupported { op: 0xb4, pc }),
+    };
+    let name = cp
+        .utf8(name_index)
+        .ok_or(IrError::Unsupported { op: 0xb4, pc })?;
+    let desc = cp
+        .utf8(desc_index)
+        .ok_or(IrError::Unsupported { op: 0xb4, pc })?;
+    let mut idx = 0u16;
+    for m in &cf.fields {
+        if m.access_flags & 0x0008 != 0 {
+            continue; // skip static fields
+        }
+        if m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc) {
+            return Ok((idx, field_tag(desc, pc)?));
+        }
+        idx += 1;
+    }
+    Err(IrError::Unsupported { op: 0xb4, pc })
+}
+
+/// Resolve `invokespecial`: `Some(method index)` for a same-class instance method (`<init>`), or
+#[allow(clippy::type_complexity)]
+/// `None` for a cross-class no-op (e.g. `Object.<init>`; void only in increment 3).
+fn resolve_invokespecial(
+    cf: &ClassFile,
+    cpidx: u16,
+    pc: u32,
+) -> Result<(Option<u16>, Vec<VType>, Option<VType>), IrError> {
+    let cp = &cf.constant_pool;
+    let (class_index, nat) = match cp.get(cpidx) {
+        Some(Constant::MethodRef {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => return Err(IrError::Unsupported { op: 0xb7, pc }),
+    };
+    let (name_index, desc_index) = match cp.get(nat) {
+        Some(Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        }) => (*name_index, *descriptor_index),
+        _ => return Err(IrError::Unsupported { op: 0xb7, pc }),
+    };
+    let desc = cp
+        .utf8(desc_index)
+        .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
+    let (arg_ty, ret_ty) =
+        parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb7, pc })?;
+    if cp.class_name(class_index) == cf.this_class_name() {
+        let name = cp
+            .utf8(name_index)
+            .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
+        let mindex = cf
+            .methods
+            .iter()
+            .position(|m| m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc))
+            .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
+        Ok((Some(mindex as u16), arg_ty, ret_ty))
+    } else {
+        if ret_ty.is_some() {
+            return Err(IrError::Unsupported { op: 0xb7, pc }); // cross-class non-void: increment 6
+        }
+        Ok((None, arg_ty, ret_ty))
+    }
 }
 
 fn if_cond(op: u8) -> IntCond {
@@ -523,6 +628,108 @@ impl Ssa {
                         stack.push(id);
                     }
                 }
+                // reference constant / dup / reference locals
+                0x01 => self.konst(nodes, &mut stack, Val128::null())?, // aconst_null
+                0x59 => {
+                    // dup: duplicate the top SSA value (both stack slots reference it).
+                    let top = *stack.last().ok_or(IrError::StackUnderflow(pc))?;
+                    stack.push(top);
+                }
+                0x19 => {
+                    let v = self.read_variable(ins.arg as u16, block)?;
+                    stack.push(v);
+                }
+                0x2a..=0x2d => {
+                    let v = self.read_variable((ins.op - 0x2a) as u16, block)?;
+                    stack.push(v);
+                }
+                0x3a => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable(ins.arg as u16, block, v);
+                }
+                0x4b..=0x4e => {
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.write_variable((ins.op - 0x4b) as u16, block, v);
+                }
+                // objects
+                0xbb => {
+                    // new: allocate a local (S1) object of this class; result is a handle.
+                    let n_fields = instance_field_count(cf);
+                    self.emit(
+                        nodes,
+                        &mut stack,
+                        Op::New {
+                            escape: EscapeState::S1,
+                            n_fields,
+                        },
+                        smallvec![],
+                        Tag::Handle,
+                        Effect::WriteHeap,
+                    )?;
+                }
+                0xb4 => {
+                    // getfield: pop objectref, push the field value.
+                    let (fidx, fty) = resolve_field(cf, ins.arg as u16, pc)?;
+                    let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.emit(
+                        nodes,
+                        &mut stack,
+                        Op::GetField(fidx),
+                        smallvec![obj],
+                        fty,
+                        Effect::ReadHeap,
+                    )?;
+                }
+                0xb5 => {
+                    // putfield: pop value then objectref (no result).
+                    let (fidx, _) = resolve_field(cf, ins.arg as u16, pc)?;
+                    let val = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let id = self.fresh()?;
+                    nodes.push(Node {
+                        id,
+                        op: Op::PutField(fidx),
+                        ins: smallvec![obj, val],
+                        ty: Tag::I32,
+                        effect: Effect::WriteHeap,
+                    });
+                }
+                0xb7 => {
+                    // invokespecial: intra-class <init> executes; cross-class (Object.<init>) no-op.
+                    let (mindex, arg_ty, ret_ty) = resolve_invokespecial(cf, ins.arg as u16, pc)?;
+                    let mut popped: SmallVec<[ValId; 3]> = SmallVec::new();
+                    for _ in 0..arg_ty.len() {
+                        popped.push(stack.pop().ok_or(IrError::StackUnderflow(pc))?);
+                    }
+                    let this = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    if let Some(midx) = mindex {
+                        let mut ins_v: SmallVec<[ValId; 3]> = SmallVec::new();
+                        ins_v.push(this);
+                        for a in popped.iter().rev() {
+                            ins_v.push(*a);
+                        }
+                        let ty = match ret_ty {
+                            None | Some(VType::Int) => Tag::I32,
+                            Some(VType::Long) => Tag::I64,
+                            Some(VType::Float) => Tag::F32,
+                            Some(VType::Double) => Tag::F64,
+                            Some(_) => return Err(IrError::Unsupported { op: 0xb7, pc }),
+                        };
+                        let id = self.fresh()?;
+                        nodes.push(Node {
+                            id,
+                            op: Op::InvokeSpecial(midx),
+                            ins: ins_v,
+                            ty,
+                            effect: Effect::Extern,
+                        });
+                        if ret_ty.is_some() {
+                            stack.push(id);
+                        }
+                    }
+                    // cross-class no-op: `this`/args already consumed.
+                }
+                0xb1 => term = Some(Terminator::Return(None)), // return (void)
                 _ => return Err(IrError::Unsupported { op: ins.op, pc }),
             }
         }

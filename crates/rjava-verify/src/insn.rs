@@ -55,9 +55,11 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             // istore_<n>/lstore_<n>/fstore_<n>; int/long/float add/sub/mul; idiv/irem/ineg;
             // i2l/i2f/l2i/l2f/f2i/f2l; lcmp/fcmpl/fcmpg; ireturn.
             0x00
+            | 0x01
             | 0x02..=0x0d
-            | 0x1a..=0x25
-            | 0x3b..=0x46
+            | 0x1a..=0x2d
+            | 0x3b..=0x4e
+            | 0x59
             | 0x60..=0x62
             | 0x64..=0x66
             | 0x68..=0x6a
@@ -73,7 +75,8 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             | 0x8c
             | 0x94..=0x96
             | 0xac
-            | 0xad => (0, 1),
+            | 0xad
+            | 0xb1 => (0, 1),
             0x84 => {
                 // iinc index, const: pack the u1 index and i1 const into `arg`.
                 let index = u1_at(code, pc + 1)? as i64;
@@ -82,11 +85,12 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             }
             0x10 => (s1_at(code, pc + 1)?, 2), // bipush
             0x11 => (s2_at(code, pc + 1)?, 3), // sipush
-            0x15..=0x17 => (u1_at(code, pc + 1)? as i64, 2), // iload/lload/fload
-            0x36..=0x38 => (u1_at(code, pc + 1)? as i64, 2), // istore/lstore/fstore
+            0x15..=0x17 | 0x19 => (u1_at(code, pc + 1)? as i64, 2), // iload/lload/fload/aload
+            0x36..=0x38 | 0x3a => (u1_at(code, pc + 1)? as i64, 2), // istore/lstore/fstore/astore
             0x12 => (u1_at(code, pc + 1)? as i64, 2), // ldc
             0x13 | 0x14 => (u2_at(code, pc + 1)?, 3), // ldc_w / ldc2_w
-            0xb8 => (u2_at(code, pc + 1)?, 3), // invokestatic (methodref cp index)
+            // invokestatic / invokespecial / new / getfield / putfield (cp index)
+            0xb8 | 0xb7 | 0xbb | 0xb4 | 0xb5 => (u2_at(code, pc + 1)?, 3),
             0x99..=0xa4 | 0xa7 => (pc as i64 + s2_at(code, pc + 1)?, 3), // if<cond>/if_icmp/goto
             _ => return Err(VerifyError::UnsupportedOpcode { op, pc: pc as u32 }),
         };

@@ -78,6 +78,11 @@ fn parse_field_type(b: &[u8], mut i: usize) -> Result<(VType, usize), VerifyErro
     Ok((t, i + 1))
 }
 
+/// The verification type of a single field descriptor (JVMS §4.3.2), e.g. `I` or `LPoint;`.
+pub fn parse_field_descriptor(desc: &str) -> Result<VType, VerifyError> {
+    parse_field_type(desc.as_bytes(), 0).map(|(t, _)| t)
+}
+
 /// Parse a method descriptor into its argument types and return type (`None` = `void`).
 pub fn parse_method_descriptor(desc: &str) -> Result<(Vec<VType>, Option<VType>), VerifyError> {
     let b = desc.as_bytes();

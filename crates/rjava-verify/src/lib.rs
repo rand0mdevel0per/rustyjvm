@@ -19,7 +19,7 @@ use rjava_classfile::{ClassFile, Constant, ConstantPool, MemberInfo};
 pub use error::VerifyError;
 pub use insn::{decode, pc_index, Insn};
 pub use stackmap::Frame;
-pub use vtype::{is_assignable, parse_method_descriptor, VType};
+pub use vtype::{is_assignable, parse_field_descriptor, parse_method_descriptor, VType};
 
 const ACC_STATIC: u16 = 0x0008;
 
@@ -275,6 +275,79 @@ fn methodref_descriptor(
     parse_method_descriptor(desc)
 }
 
+/// The verification type a `Fieldref` names.
+fn fieldref_type(cp: &ConstantPool, index: u16, pc: u32) -> Result<VType, VerifyError> {
+    let nat = match cp.get(index) {
+        Some(Constant::FieldRef {
+            name_and_type_index,
+            ..
+        }) => *name_and_type_index,
+        _ => {
+            return Err(VerifyError::TypeMismatch {
+                pc,
+                what: "not a Fieldref",
+            })
+        }
+    };
+    let desc_idx = match cp.get(nat) {
+        Some(Constant::NameAndType {
+            descriptor_index, ..
+        }) => *descriptor_index,
+        _ => {
+            return Err(VerifyError::TypeMismatch {
+                pc,
+                what: "bad NameAndType",
+            })
+        }
+    };
+    let desc = cp.utf8(desc_idx).ok_or(VerifyError::BadDescriptor)?;
+    parse_field_descriptor(desc)
+}
+
+fn is_reference(t: VType) -> bool {
+    matches!(
+        t,
+        VType::Reference | VType::Null | VType::UninitializedThis | VType::Uninitialized(_)
+    )
+}
+
+/// aload / aload_<n>: push the reference held in local `idx`.
+fn aload(
+    f: &mut AbstractFrame,
+    idx: u16,
+    max_stack: u16,
+    max_locals: u16,
+    pc: u32,
+) -> Result<(), VerifyError> {
+    if idx as usize >= max_locals as usize {
+        return Err(VerifyError::BadLocal { pc, index: idx });
+    }
+    let t = f.locals[idx as usize];
+    if !is_reference(t) {
+        return Err(VerifyError::TypeMismatch {
+            pc,
+            what: "aload of non-reference local",
+        });
+    }
+    f.push(t, max_stack, pc)
+}
+
+/// astore / astore_<n>: pop a reference into local `idx`.
+fn astore(f: &mut AbstractFrame, idx: u16, max_locals: u16, pc: u32) -> Result<(), VerifyError> {
+    if idx as usize >= max_locals as usize {
+        return Err(VerifyError::BadLocal { pc, index: idx });
+    }
+    let v = f.stack.pop().ok_or(VerifyError::StackUnderflow(pc))?;
+    if !is_reference(v) {
+        return Err(VerifyError::TypeMismatch {
+            pc,
+            what: "astore of non-reference",
+        });
+    }
+    f.locals[idx as usize] = v;
+    Ok(())
+}
+
 fn load(
     f: &mut AbstractFrame,
     idx: u16,
@@ -476,6 +549,52 @@ fn apply(
                 f.push(r, max_stack, pc)?;
             }
         }
+        0x01 => f.push(VType::Null, max_stack, pc)?, // aconst_null
+        0x59 => {
+            // dup: duplicate the top category-1 operand.
+            let t = *f.stack.last().ok_or(VerifyError::StackUnderflow(pc))?;
+            if t.is_category2() {
+                return Err(VerifyError::TypeMismatch {
+                    pc,
+                    what: "dup of category-2 value",
+                });
+            }
+            f.push(t, max_stack, pc)?;
+        }
+        0x19 => aload(f, ins.arg as u16, max_stack, max_locals, pc)?,
+        0x2a..=0x2d => aload(f, (ins.op - 0x2a) as u16, max_stack, max_locals, pc)?,
+        0x3a => astore(f, ins.arg as u16, max_locals, pc)?,
+        0x4b..=0x4e => astore(f, (ins.op - 0x4b) as u16, max_locals, pc)?,
+        0xbb => f.push(VType::Reference, max_stack, pc)?, // new (uninitialized ref; simplified)
+        0xb4 => {
+            // getfield: pop objectref, push the field's type.
+            f.pop_expect(VType::Reference, pc)?;
+            let ft = fieldref_type(cp, ins.arg as u16, pc)?;
+            f.push(ft, max_stack, pc)?;
+        }
+        0xb5 => {
+            // putfield: pop value then objectref.
+            let ft = fieldref_type(cp, ins.arg as u16, pc)?;
+            f.pop_expect(ft, pc)?;
+            f.pop_expect(VType::Reference, pc)?;
+        }
+        0xb7 => {
+            // invokespecial: pop args (reverse), pop `this`, push return.
+            let (arg_ty, ret_ty) = methodref_descriptor(cp, ins.arg as u16, pc)?;
+            for &t in arg_ty.iter().rev() {
+                f.pop_expect(t, pc)?;
+            }
+            f.pop_expect(VType::Reference, pc)?;
+            if let Some(r) = ret_ty {
+                f.push(r, max_stack, pc)?;
+            }
+        }
+        0xb1 => {
+            // return (void)
+            if ret.is_some() {
+                return Err(VerifyError::BadReturn(pc));
+            }
+        }
         _ => return Err(VerifyError::UnsupportedOpcode { op: ins.op, pc }),
     }
     Ok(())
@@ -524,12 +643,17 @@ mod tests {
         assert_eq!(vm.frames.len(), 2);
         assert!(vm.frames.contains_key(&63));
         assert!(vm.frames.contains_key(&76));
-        // <init> uses aload_0/invokespecial/return — outside the increment-1 opcode set — so it
-        // must be rejected as unsupported (reject-unknown), not mis-verified.
+        // <init> uses aload_0/invokespecial/return — supported since increment 3 — so it now
+        // verifies as a void, no-argument instance method.
         let init = cf.method("<init>", "()V").unwrap();
+        let ivm = verify_method(&cf, init).expect("<init> must verify (increment 3 opcodes)");
+        assert!(!ivm.is_static);
+        assert!(ivm.arg_types.is_empty());
+        assert_eq!(ivm.ret, None);
+        // Reject-unknown still holds for opcodes outside the supported set.
         assert!(matches!(
-            verify_method(&cf, init),
-            Err(VerifyError::UnsupportedOpcode { .. })
+            decode(&[0xfe]),
+            Err(VerifyError::UnsupportedOpcode { op: 0xfe, .. })
         ));
     }
 

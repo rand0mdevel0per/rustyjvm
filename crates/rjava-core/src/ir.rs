@@ -6,6 +6,7 @@
 use portable_atomic::AtomicU32;
 use smallvec::SmallVec;
 
+use crate::diff::EscapeState;
 use crate::ids::{BlockId, ClassId, SlotId};
 use crate::value::{Tag, Val128};
 
@@ -77,6 +78,21 @@ pub enum Op {
     /// table. Its `ins` are the argument values in order; `ty` is the return type (ignored for
     /// `void`). Cross-class dispatch arrives with the loader (increment 6).
     InvokeStatic(u16),
+    /// Allocate a fresh object of the current class with `n_fields` null-initialised fields
+    /// (§4, §5). `escape` is the escape-analysis classification. `ins` is empty — allocation has no
+    /// prerequisite dependencies (§22.1).
+    New {
+        escape: EscapeState,
+        n_fields: u16,
+    },
+    /// Read instance field `index` of the object in `ins[0]` (§8); `ty` is the field type.
+    GetField(u16),
+    /// Write `ins[1]` into instance field `index` of the object in `ins[0]`.
+    PutField(u16),
+    /// `invokespecial` of a same-class instance method (`<init>`) by method index; `ins` is
+    /// `[this, args...]`. Cross-class `invokespecial` (e.g. `Object.<init>`) is a no-op handled in
+    /// the IR (the receiver is simply consumed).
+    InvokeSpecial(u16),
 }
 
 /// An SSA node: a single value definition (§9.2).
