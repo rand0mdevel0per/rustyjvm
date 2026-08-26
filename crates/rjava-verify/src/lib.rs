@@ -539,15 +539,39 @@ fn apply(
                 return Err(VerifyError::BadReturn(pc));
             }
         } // lreturn
-        0xb8 => {
-            // invokestatic: pop arguments (in reverse) per the target descriptor, push the return.
+        0xb6..=0xb8 => {
+            // invoke*: pop arguments (in reverse) per the target descriptor, then the receiver for
+            // an instance call, then push the return value.
             let (arg_ty, ret_ty) = methodref_descriptor(cp, ins.arg as u16, pc)?;
             for &t in arg_ty.iter().rev() {
                 f.pop_expect(t, pc)?;
             }
+            if ins.op != 0xb8 {
+                f.pop_expect(VType::Reference, pc)?;
+            }
             if let Some(r) = ret_ty {
                 f.push(r, max_stack, pc)?;
             }
+        }
+        0xb2 => {
+            // getstatic
+            let ft = fieldref_type(cp, ins.arg as u16, pc)?;
+            f.push(ft, max_stack, pc)?;
+        }
+        0xb3 => {
+            // putstatic
+            let ft = fieldref_type(cp, ins.arg as u16, pc)?;
+            f.pop_expect(ft, pc)?;
+        }
+        0xc1 => {
+            // instanceof: reference in, int out
+            f.pop_expect(VType::Reference, pc)?;
+            f.push(VType::Int, max_stack, pc)?;
+        }
+        0xc0 => {
+            // checkcast: the reference passes through with the named type
+            f.pop_expect(VType::Reference, pc)?;
+            f.push(VType::Reference, max_stack, pc)?;
         }
         0x01 => f.push(VType::Null, max_stack, pc)?, // aconst_null
         0x59 => {
@@ -578,17 +602,14 @@ fn apply(
             f.pop_expect(ft, pc)?;
             f.pop_expect(VType::Reference, pc)?;
         }
-        0xb7 => {
-            // invokespecial: pop args (reverse), pop `this`, push return.
-            let (arg_ty, ret_ty) = methodref_descriptor(cp, ins.arg as u16, pc)?;
-            for &t in arg_ty.iter().rev() {
-                f.pop_expect(t, pc)?;
-            }
+        0xb0 => {
+            // areturn: the returned reference must match a reference return type.
             f.pop_expect(VType::Reference, pc)?;
-            if let Some(r) = ret_ty {
-                f.push(r, max_stack, pc)?;
+            if !matches!(ret, Some(VType::Reference)) {
+                return Err(VerifyError::BadReturn(pc));
             }
         }
+        0xc6 | 0xc7 => f.pop_expect(VType::Reference, pc)?, // ifnull / ifnonnull
         0xb1 => {
             // return (void)
             if ret.is_some() {

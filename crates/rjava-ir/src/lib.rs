@@ -65,55 +65,49 @@ fn stack_var(max_locals: u16, pos: usize) -> Result<u16, IrError> {
     u16::try_from(max_locals as usize + pos).map_err(|_| IrError::TooManyValues)
 }
 
-/// Resolve an `invokestatic` methodref to a same-class method index and its descriptor types.
-/// Increment 2b supports intra-class static calls only; cross-class dispatch awaits the loader (§8).
-fn resolve_invokestatic(
+/// The descriptor text a `Methodref`/`InterfaceMethodref`/`Fieldref` constant names.
+///
+/// Only the *descriptor* is read at build time — never the target — because the operand-stack shape
+/// must be known to build SSA, while class identity and dispatch stay runtime-determined (§8.3).
+fn ref_descriptor(cf: &ClassFile, cpidx: u16, pc: u32, op: u8) -> Result<&str, IrError> {
+    let cp = &cf.constant_pool;
+    let nat = match cp.get(cpidx) {
+        Some(Constant::MethodRef {
+            name_and_type_index,
+            ..
+        })
+        | Some(Constant::InterfaceMethodRef {
+            name_and_type_index,
+            ..
+        })
+        | Some(Constant::FieldRef {
+            name_and_type_index,
+            ..
+        }) => *name_and_type_index,
+        _ => return Err(IrError::Unsupported { op, pc }),
+    };
+    let desc_index = match cp.get(nat) {
+        Some(Constant::NameAndType {
+            descriptor_index, ..
+        }) => *descriptor_index,
+        _ => return Err(IrError::Unsupported { op, pc }),
+    };
+    cp.utf8(desc_index).ok_or(IrError::Unsupported { op, pc })
+}
+
+/// Argument and return types of the callee a `Methodref` names.
+fn callee_descriptor(
     cf: &ClassFile,
     cpidx: u16,
     pc: u32,
-) -> Result<(u16, Vec<VType>, Option<VType>), IrError> {
-    let cp = &cf.constant_pool;
-    let (class_index, nat_index) = match cp.get(cpidx) {
-        Some(Constant::MethodRef {
-            class_index,
-            name_and_type_index,
-        }) => (*class_index, *name_and_type_index),
-        _ => return Err(IrError::Unsupported { op: 0xb8, pc }),
-    };
-    if cp.class_name(class_index) != cf.this_class_name() {
-        return Err(IrError::Unsupported { op: 0xb8, pc });
-    }
-    let (name_index, desc_index) = match cp.get(nat_index) {
-        Some(Constant::NameAndType {
-            name_index,
-            descriptor_index,
-        }) => (*name_index, *descriptor_index),
-        _ => return Err(IrError::Unsupported { op: 0xb8, pc }),
-    };
-    let name = cp
-        .utf8(name_index)
-        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
-    let desc = cp
-        .utf8(desc_index)
-        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
-    let mindex = cf
-        .methods
-        .iter()
-        .position(|m| m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc))
-        .ok_or(IrError::Unsupported { op: 0xb8, pc })?;
-    let (arg_ty, ret_ty) =
-        parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb8, pc })?;
-    Ok((mindex as u16, arg_ty, ret_ty))
+) -> Result<(Vec<VType>, Option<VType>), IrError> {
+    let desc = ref_descriptor(cf, cpidx, pc, 0xb8)?;
+    parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb8, pc })
 }
 
-fn instance_field_count(cf: &ClassFile) -> u16 {
-    cf.fields
-        .iter()
-        .filter(|m| m.access_flags & 0x0008 == 0)
-        .count() as u16
-}
-
-fn field_tag(desc: &str, pc: u32) -> Result<Tag, IrError> {
+/// The value tag of the field a `Fieldref` names.
+fn fieldref_tag(cf: &ClassFile, cpidx: u16, pc: u32) -> Result<Tag, IrError> {
+    let desc = ref_descriptor(cf, cpidx, pc, 0xb4)?;
     Ok(match desc.as_bytes().first() {
         Some(b'B' | b'C' | b'I' | b'S' | b'Z') => Tag::I32,
         Some(b'J') => Tag::I64,
@@ -124,98 +118,16 @@ fn field_tag(desc: &str, pc: u32) -> Result<Tag, IrError> {
     })
 }
 
-/// Resolve a same-class instance-field ref to (field index, field type). Cross-class fields await
-/// the loader (increment 6).
-fn resolve_field(cf: &ClassFile, cpidx: u16, pc: u32) -> Result<(u16, Tag), IrError> {
-    let cp = &cf.constant_pool;
-    let (class_index, nat) = match cp.get(cpidx) {
-        Some(Constant::FieldRef {
-            class_index,
-            name_and_type_index,
-        }) => (*class_index, *name_and_type_index),
-        _ => return Err(IrError::Unsupported { op: 0xb4, pc }),
-    };
-    if cp.class_name(class_index) != cf.this_class_name() {
-        return Err(IrError::Unsupported { op: 0xb4, pc });
-    }
-    let (name_index, desc_index) = match cp.get(nat) {
-        Some(Constant::NameAndType {
-            name_index,
-            descriptor_index,
-        }) => (*name_index, *descriptor_index),
-        _ => return Err(IrError::Unsupported { op: 0xb4, pc }),
-    };
-    let name = cp
-        .utf8(name_index)
-        .ok_or(IrError::Unsupported { op: 0xb4, pc })?;
-    let desc = cp
-        .utf8(desc_index)
-        .ok_or(IrError::Unsupported { op: 0xb4, pc })?;
-    let mut idx = 0u16;
-    for m in &cf.fields {
-        if m.access_flags & 0x0008 != 0 {
-            continue; // skip static fields
-        }
-        if m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc) {
-            return Ok((idx, field_tag(desc, pc)?));
-        }
-        idx += 1;
-    }
-    Err(IrError::Unsupported { op: 0xb4, pc })
-}
-
-#[allow(clippy::type_complexity)]
-/// Resolve `invokespecial`: `Some(method index)` for a same-class instance method, or `None` for
-/// the one cross-class call that is genuinely a no-op — `java/lang/Object.<init>()V`, which has no
-/// observable effect.
-///
-/// Any *other* cross-class `invokespecial` (a real superclass constructor, which may write fields)
-/// is rejected as unsupported rather than silently dropped: no-op'ing it would leave the object
-/// partially initialised and produce silently wrong results. Real superclass calls arrive with the
-/// loader in increment 6 (§8).
-fn resolve_invokespecial(
-    cf: &ClassFile,
-    cpidx: u16,
-    pc: u32,
-) -> Result<(Option<u16>, Vec<VType>, Option<VType>), IrError> {
-    let cp = &cf.constant_pool;
-    let (class_index, nat) = match cp.get(cpidx) {
-        Some(Constant::MethodRef {
-            class_index,
-            name_and_type_index,
-        }) => (*class_index, *name_and_type_index),
-        _ => return Err(IrError::Unsupported { op: 0xb7, pc }),
-    };
-    let (name_index, desc_index) = match cp.get(nat) {
-        Some(Constant::NameAndType {
-            name_index,
-            descriptor_index,
-        }) => (*name_index, *descriptor_index),
-        _ => return Err(IrError::Unsupported { op: 0xb7, pc }),
-    };
-    let desc = cp
-        .utf8(desc_index)
-        .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
-    let name = cp
-        .utf8(name_index)
-        .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
-    let (arg_ty, ret_ty) =
-        parse_method_descriptor(desc).map_err(|_| IrError::Unsupported { op: 0xb7, pc })?;
-    if cp.class_name(class_index) == cf.this_class_name() {
-        let mindex = cf
-            .methods
-            .iter()
-            .position(|m| m.name(cp) == Some(name) && m.descriptor(cp) == Some(desc))
-            .ok_or(IrError::Unsupported { op: 0xb7, pc })?;
-        Ok((Some(mindex as u16), arg_ty, ret_ty))
-    } else if cp.class_name(class_index) == Some("java/lang/Object")
-        && name == "<init>"
-        && desc == "()V"
-    {
-        Ok((None, arg_ty, ret_ty)) // the only effect-free cross-class constructor
-    } else {
-        Err(IrError::Unsupported { op: 0xb7, pc })
-    }
+/// The tag a call's result carries. `void` gets a placeholder that is never pushed.
+fn return_tag(ret: Option<VType>, op: u8, pc: u32) -> Result<Tag, IrError> {
+    Ok(match ret {
+        None | Some(VType::Int) => Tag::I32,
+        Some(VType::Long) => Tag::I64,
+        Some(VType::Float) => Tag::F32,
+        Some(VType::Double) => Tag::F64,
+        Some(VType::Reference) | Some(VType::Null) => Tag::Ptr,
+        Some(_) => return Err(IrError::Unsupported { op, pc }),
+    })
 }
 
 fn if_cond(op: u8) -> IntCond {
@@ -238,10 +150,6 @@ fn if_icmp_cond(op: u8) -> IntCond {
         0xa3 => IntCond::Gt,
         _ => IntCond::Le, // 0xa4
     }
-}
-
-fn is_return(op: u8) -> bool {
-    (0xac..=0xb1).contains(&op)
 }
 
 /// Basic-block leaders: entry, every branch target, and the instruction after every branch/return.
@@ -605,29 +513,52 @@ impl Ssa {
                         .ok_or(IrError::BadBlock(pc))?;
                     term = Some(Terminator::Goto(taken));
                 }
-                0xac | 0xad => {
+                0xac | 0xad | 0xb0 => {
                     let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     term = Some(Terminator::Return(Some(v)));
                 }
-                0xb8 => {
-                    // invokestatic: pop the arguments (reverse), emit a call node, push the result.
-                    let (mindex, arg_ty, ret_ty) = resolve_invokestatic(cf, ins.arg as u16, pc)?;
+                0xc6 | 0xc7 => {
+                    // ifnull / ifnonnull: test the reference, then branch on the int result.
+                    let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let cond = self.fresh()?;
+                    nodes.push(Node {
+                        id: cond,
+                        op: Op::TestNull {
+                            expect_null: ins.op == 0xc6,
+                        },
+                        ins: smallvec![v],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    term = Some(cond_branch(cond, ins, block_of, pc)?);
+                }
+                // ---- symbolic references: resolved at runtime through the registry (§8.3) ----
+                0xb6..=0xb8 => {
+                    // invokestatic / invokespecial / invokevirtual. The target is *not* resolved
+                    // here: class identity and dispatch are runtime-determined (P-3, §13.4), so the
+                    // node keeps the constant-pool index. Only the descriptor is read, because the
+                    // operand stack shape must be known to build SSA.
+                    let (arg_ty, ret_ty) = callee_descriptor(cf, ins.arg as u16, pc)?;
                     let mut args: SmallVec<[ValId; 3]> = SmallVec::new();
                     for _ in 0..arg_ty.len() {
                         args.push(stack.pop().ok_or(IrError::StackUnderflow(pc))?);
                     }
                     args.reverse();
-                    let ty = match ret_ty {
-                        None | Some(VType::Int) => Tag::I32, // void: placeholder, never pushed
-                        Some(VType::Long) => Tag::I64,
-                        Some(VType::Float) => Tag::F32,
-                        Some(VType::Double) => Tag::F64,
-                        Some(_) => return Err(IrError::Unsupported { op: 0xb8, pc }),
+                    if ins.op != 0xb8 {
+                        // Instance calls take the receiver first.
+                        let this = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                        args.insert(0, this);
+                    }
+                    let ty = return_tag(ret_ty, ins.op, pc)?;
+                    let op = match ins.op {
+                        0xb8 => Op::InvokeStatic(ins.arg as u16),
+                        0xb7 => Op::InvokeSpecial(ins.arg as u16),
+                        _ => Op::InvokeVirtual(ins.arg as u16),
                     };
                     let id = self.fresh()?;
                     nodes.push(Node {
                         id,
-                        op: Op::InvokeStatic(mindex),
+                        op,
                         ins: args,
                         ty,
                         effect: Effect::Extern,
@@ -659,16 +590,14 @@ impl Ssa {
                     let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     self.write_variable((ins.op - 0x4b) as u16, block, v);
                 }
-                // objects
                 0xbb => {
-                    // new: allocate a local (S1) object of this class; result is a handle.
-                    let n_fields = instance_field_count(cf);
+                    // new: the class is named symbolically; escape analysis fills in S1 vs S2 below.
                     self.emit(
                         nodes,
                         &mut stack,
                         Op::New {
+                            class_cp: ins.arg as u16,
                             escape: EscapeState::S1,
-                            n_fields,
                         },
                         smallvec![],
                         Tag::Handle,
@@ -677,12 +606,12 @@ impl Ssa {
                 }
                 0xb4 => {
                     // getfield: pop objectref, push the field value.
-                    let (fidx, fty) = resolve_field(cf, ins.arg as u16, pc)?;
+                    let fty = fieldref_tag(cf, ins.arg as u16, pc)?;
                     let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     self.emit(
                         nodes,
                         &mut stack,
-                        Op::GetField(fidx),
+                        Op::GetField(ins.arg as u16),
                         smallvec![obj],
                         fty,
                         Effect::ReadHeap,
@@ -690,52 +619,61 @@ impl Ssa {
                 }
                 0xb5 => {
                     // putfield: pop value then objectref (no result).
-                    let (fidx, _) = resolve_field(cf, ins.arg as u16, pc)?;
                     let val = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     let id = self.fresh()?;
                     nodes.push(Node {
                         id,
-                        op: Op::PutField(fidx),
+                        op: Op::PutField(ins.arg as u16),
                         ins: smallvec![obj, val],
                         ty: Tag::I32,
                         effect: Effect::WriteHeap,
                     });
                 }
-                0xb7 => {
-                    // invokespecial: intra-class <init> executes; cross-class (Object.<init>) no-op.
-                    let (mindex, arg_ty, ret_ty) = resolve_invokespecial(cf, ins.arg as u16, pc)?;
-                    let mut popped: SmallVec<[ValId; 3]> = SmallVec::new();
-                    for _ in 0..arg_ty.len() {
-                        popped.push(stack.pop().ok_or(IrError::StackUnderflow(pc))?);
-                    }
-                    let this = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
-                    if let Some(midx) = mindex {
-                        let mut ins_v: SmallVec<[ValId; 3]> = SmallVec::new();
-                        ins_v.push(this);
-                        for a in popped.iter().rev() {
-                            ins_v.push(*a);
-                        }
-                        let ty = match ret_ty {
-                            None | Some(VType::Int) => Tag::I32,
-                            Some(VType::Long) => Tag::I64,
-                            Some(VType::Float) => Tag::F32,
-                            Some(VType::Double) => Tag::F64,
-                            Some(_) => return Err(IrError::Unsupported { op: 0xb7, pc }),
-                        };
-                        let id = self.fresh()?;
-                        nodes.push(Node {
-                            id,
-                            op: Op::InvokeSpecial(midx),
-                            ins: ins_v,
-                            ty,
-                            effect: Effect::Extern,
-                        });
-                        if ret_ty.is_some() {
-                            stack.push(id);
-                        }
-                    }
-                    // cross-class no-op: `this`/args already consumed.
+                0xb2 => {
+                    // getstatic: reading a static field is an active use, so it may run <clinit>.
+                    let fty = fieldref_tag(cf, ins.arg as u16, pc)?;
+                    self.emit(
+                        nodes,
+                        &mut stack,
+                        Op::GetStatic(ins.arg as u16),
+                        smallvec![],
+                        fty,
+                        Effect::Extern,
+                    )?;
+                }
+                0xb3 => {
+                    let val = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let id = self.fresh()?;
+                    nodes.push(Node {
+                        id,
+                        op: Op::PutStatic(ins.arg as u16),
+                        ins: smallvec![val],
+                        ty: Tag::I32,
+                        effect: Effect::Extern,
+                    });
+                }
+                0xc1 => {
+                    let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.emit(
+                        nodes,
+                        &mut stack,
+                        Op::InstanceOf(ins.arg as u16),
+                        smallvec![obj],
+                        Tag::I32,
+                        Effect::ReadHeap,
+                    )?;
+                }
+                0xc0 => {
+                    let obj = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    self.emit(
+                        nodes,
+                        &mut stack,
+                        Op::CheckCast(ins.arg as u16),
+                        smallvec![obj],
+                        Tag::Ptr,
+                        Effect::MayThrow { caught: false },
+                    )?;
                 }
                 0xb1 => term = Some(Terminator::Return(None)), // return (void)
                 _ => return Err(IrError::Unsupported { op: ins.op, pc }),
@@ -776,32 +714,31 @@ fn successors(
     nblocks: usize,
     block_of: &HashMap<u32, BlockId>,
 ) -> Vec<BlockId> {
-    let next = |bidx: usize| -> Vec<BlockId> {
+    let fall_through = |bidx: usize| -> Vec<BlockId> {
         if bidx + 1 < nblocks {
             vec![BlockId((bidx + 1) as u32)]
         } else {
             vec![]
         }
     };
-    match last {
-        Some(ins) if (0x99..=0xa4).contains(&ins.op) => {
-            let mut s = Vec::new();
-            if let Some(t) = ins.branch_target().and_then(|t| block_of.get(&t)) {
-                s.push(*t);
-            }
-            if let Some(&fb) = block_of.get(&(ins.pc + ins.len as u32)) {
-                s.push(fb);
-            }
-            s
-        }
-        Some(ins) if ins.op == 0xa7 => ins
-            .branch_target()
-            .and_then(|t| block_of.get(&t))
-            .map(|b| vec![*b])
-            .unwrap_or_default(),
-        Some(ins) if is_return(ins.op) => vec![],
-        _ => next(bidx),
+    let Some(ins) = last else {
+        return fall_through(bidx);
+    };
+    // Derived from the decoder's own predicates rather than a second opcode list, so a new branch
+    // or return opcode cannot leave a target unreachable here (which would silently drop the
+    // target block's terminator).
+    let mut out = Vec::new();
+    if let Some(t) = ins.branch_target().and_then(|t| block_of.get(&t)) {
+        out.push(*t);
     }
+    if !ins.is_unconditional_end() {
+        // A conditional branch also falls through; a plain instruction only falls through.
+        match block_of.get(&(ins.pc + ins.len as u32)) {
+            Some(&fb) => out.push(fb),
+            None => out.extend(fall_through(bidx)),
+        }
+    }
+    out
 }
 
 /// Reverse post-order of the reachable blocks from `entry`.
@@ -830,6 +767,79 @@ fn reverse_postorder(
     }
     post.reverse();
     post
+}
+
+/// Escape analysis (§9.4): classify each allocation as S1 (scope-exclusive) or S2 (thread-local
+/// shared), promoting the node's `escape` and its static tag accordingly.
+///
+/// A value escapes its scope if it is returned, thrown, stored into an object's field, or passed to
+/// a call (conservative — without interprocedural analysis the callee might retain it). A φ that
+/// escapes makes all of its sources escape, so the seeds are propagated to a fixpoint.
+///
+/// Classification is deliberately **conservative**: when non-escape cannot be proven the allocation
+/// is promoted to the more general state, never under-classified (§9.4). Objects that stay S1 cost
+/// nothing at all — no reference count, no barrier — which is the point (P-2, §5.1).
+fn mark_escapes(blocks: &mut [Block]) {
+    let mut escaping: HashSet<ValId> = HashSet::new();
+
+    for b in blocks.iter() {
+        for n in &b.nodes {
+            match n.op {
+                // The stored value outlives this scope inside the receiver.
+                Op::PutField(_) => {
+                    if let Some(v) = n.ins.get(1) {
+                        escaping.insert(*v);
+                    }
+                }
+                // A static field outlives every scope, so anything stored in one escapes.
+                Op::PutStatic(_) => {
+                    escaping.extend(n.ins.iter().copied());
+                }
+                // Arguments (and an `<init>` receiver) may be retained by the callee.
+                Op::InvokeStatic(_) | Op::InvokeSpecial(_) | Op::InvokeVirtual(_) => {
+                    escaping.extend(n.ins.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        match &b.term {
+            Terminator::Return(Some(v)) | Terminator::Throw(v) => {
+                escaping.insert(*v);
+            }
+            _ => {}
+        }
+    }
+
+    // A φ merges its sources into one value: if the merged value escapes, each source does too.
+    loop {
+        let mut changed = false;
+        for b in blocks.iter() {
+            for p in &b.phis {
+                if escaping.contains(&p.slot) {
+                    for (_, src) in &p.sources {
+                        changed |= escaping.insert(*src);
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for b in blocks.iter_mut() {
+        for n in &mut b.nodes {
+            if let Op::New { class_cp, .. } = n.op {
+                if escaping.contains(&n.id) {
+                    n.op = Op::New {
+                        class_cp,
+                        escape: EscapeState::S2,
+                    };
+                    n.ty = Tag::Ptr; // shared reference, no longer a move-only handle (§4.2)
+                }
+            }
+        }
+    }
 }
 
 /// Build the L1 SSA form of a verified method.
@@ -998,6 +1008,8 @@ pub fn build(vm: &VerifiedMethod, cf: &ClassFile) -> Result<BuiltMethod, IrError
         });
     }
 
+    mark_escapes(&mut blocks);
+
     Ok(BuiltMethod {
         method: Method {
             blocks,
@@ -1054,12 +1066,15 @@ mod tests {
         assert_eq!(built.arg_vals.len(), 1); // n
     }
 
-    /// Regression for a review finding: a genuine superclass constructor writes fields, so its
-    /// cross-class `invokespecial` must be rejected rather than no-op'd (which would leave the
-    /// object partially initialised and silently produce wrong results). Real superclass calls
-    /// arrive with the loader in increment 6.
+    /// A genuine superclass constructor writes fields, so its call must survive into the IR.
+    ///
+    /// Increment 5 could not resolve a cross-class target and deliberately *rejected* this rather
+    /// than dropping it silently (which would have left the object half-initialised). Increment 6
+    /// keeps the reference symbolic and resolves it against the registry at run time (§8.3), so it
+    /// now builds — the emitted node proves the call was not dropped. Its runtime correctness is
+    /// covered by the hierarchy differential in `rjava-interp`.
     #[test]
-    fn superclass_constructor_is_rejected_not_silently_dropped() {
+    fn superclass_constructor_survives_into_the_ir() {
         let Some(bytes) = compile("Sub") else {
             eprintln!("skipping superclass_constructor test: javac unavailable");
             return;
@@ -1067,17 +1082,27 @@ mod tests {
         let cf = rjava_classfile::parse(&bytes).unwrap();
         let init = cf.method("<init>", "()V").expect("Sub.<init>");
         let vm = rjava_verify::verify_method(&cf, init).expect("verifies");
-        assert!(
-            matches!(build(&vm, &cf), Err(IrError::Unsupported { op: 0xb7, .. })),
-            "cross-class super() must be unsupported, never a silent no-op"
+        let built = build(&vm, &cf).expect("a symbolic super() call builds");
+        let calls = built
+            .method
+            .blocks
+            .iter()
+            .flat_map(|b| &b.nodes)
+            .filter(|n| matches!(n.op, Op::InvokeSpecial(_)))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "super(...) must be emitted, never silently dropped"
         );
-        // The effect-free `Object.<init>()V` case still builds (Point-style classes).
+
+        // `Object.<init>()V` is still emitted symbolically; the interpreter recognises it as the one
+        // effect-free target and skips it, rather than the IR guessing.
         let Some(pbytes) = compile("Point") else {
             return;
         };
         let pcf = rjava_classfile::parse(&pbytes).unwrap();
         let pinit = pcf.method("<init>", "()V").unwrap();
         let pvm = rjava_verify::verify_method(&pcf, pinit).unwrap();
-        assert!(build(&pvm, &pcf).is_ok(), "Object.<init> stays a no-op");
+        assert!(build(&pvm, &pcf).is_ok());
     }
 }

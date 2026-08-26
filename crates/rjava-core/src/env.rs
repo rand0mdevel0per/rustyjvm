@@ -13,7 +13,7 @@
 use smallvec::SmallVec;
 
 use crate::diff::EnvSnapshot;
-use crate::ids::SlotId;
+use crate::ids::{RefIndex, SlotId};
 use crate::value::Val128;
 
 /// Maximum simultaneous variables per scope; the `0..1024` id ring (§9.5). A scope needing more
@@ -38,6 +38,10 @@ pub struct Env {
     slots: Vec<Val128>,
     /// Undo journal for unlanded writes: `(slot, value before the write)`, in program order.
     journal: SmallVec<[(u16, Val128); 8]>,
+    /// Reference-count adjustments this chain has accrued, in program order (§5.5). They are
+    /// **metadata**, not a data dependency: they never merge otherwise-independent chains, and they
+    /// are applied to the heap only when the chain lands — never eagerly during speculation.
+    ref_deltas: SmallVec<[(RefIndex, i32); 8]>,
     frame: LogicalFrame,
 }
 
@@ -51,6 +55,7 @@ impl Env {
         Env {
             slots: vec![Val128::null(); n_slots],
             journal: SmallVec::new(),
+            ref_deltas: SmallVec::new(),
             frame,
         }
     }
@@ -64,10 +69,36 @@ impl Env {
 
     /// Write a slot. THE indirection seam (§10.4): the previous value is journalled first, so the
     /// write belongs to the unlanded diff until [`Env::land`] commits it.
+    ///
+    /// A slot is a strong reference, so replacing one adjusts reference counts: the overwritten
+    /// referent loses a reference and the new one gains it. Both are recorded as metadata and
+    /// applied when the chain lands (§5.5).
     #[inline]
     pub fn write_slot(&mut self, s: SlotId, v: Val128) {
-        self.journal.push((s.0, self.slots[s.index()]));
+        let old = self.slots[s.index()];
+        self.journal.push((s.0, old));
         self.slots[s.index()] = v;
+        if old.tag().is_ref() {
+            self.ref_deltas.push((old.ref_index(), -1));
+        }
+        if v.tag().is_ref() {
+            self.ref_deltas.push((v.ref_index(), 1));
+        }
+    }
+
+    /// Record a reference-count adjustment that does not come from a slot write — a field store,
+    /// or handing a returned reference over to its new owner. Applied at landing, in program
+    /// order, like every other delta (§5.5).
+    #[inline]
+    pub fn record_ref_delta(&mut self, r: RefIndex, delta: i32) {
+        self.ref_deltas.push((r, delta));
+    }
+
+    /// Move this chain's recorded reference-count deltas into `out` (which is cleared first), so
+    /// the caller — which owns the heap — can apply them as the chain lands.
+    pub fn drain_ref_deltas(&mut self, out: &mut Vec<(RefIndex, i32)>) {
+        out.clear();
+        out.extend(self.ref_deltas.drain(..));
     }
 
     /// Land the pending diff **in program order** (§10.5): the writes become permanent, so the undo
@@ -86,6 +117,8 @@ impl Env {
         while let Some((slot, old)) = self.journal.pop() {
             self.slots[slot as usize] = old;
         }
+        // The discarded writes never happened, so neither did their reference-count effects.
+        self.ref_deltas.clear();
     }
 
     /// Number of unlanded writes.

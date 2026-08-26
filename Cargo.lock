@@ -308,8 +308,11 @@ dependencies = [
 name = "rjava-loader"
 version = "0.0.0"
 dependencies = [
+ "rjava-classfile",
  "rjava-core",
  "rjava-ir",
+ "rjava-verify",
+ "thiserror",
 ]
 
 [[package]]
