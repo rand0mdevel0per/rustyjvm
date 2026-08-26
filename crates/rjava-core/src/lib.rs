@@ -18,11 +18,11 @@ pub mod lock;
 pub mod registry;
 pub mod value;
 
-pub use diff::{DiffNode, EnvSnapshot, EscapeState};
+pub use diff::{chains_conflict, DiffNode, EnvSnapshot, EscapeState, FieldKey, ForkRegistry};
 pub use env::{Env, LogicalFrame, MAX_SLOTS};
 pub use ids::{BlockId, ClassId, InternedName, LoaderId, RefIndex, RegistryKey, SlotId, VtId};
 pub use ir::{
-    Block, Effect, ExcRegion, L2Op, Method, Node, Op, OpStream, Phi, Terminator, ValId,
+    Block, Effect, ExcRegion, IntCond, L2Op, Method, Node, Op, OpStream, Phi, Terminator, ValId,
     ACCEL_BLOB_BASE, ACCEL_INTERPRET, ACCEL_JIT_PENDING,
 };
 pub use lock::{Monitor, U16Lock, U32Lock};

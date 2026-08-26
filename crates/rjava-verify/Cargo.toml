@@ -9,3 +9,7 @@ repository.workspace = true
 [dependencies]
 rjava-core = { workspace = true }
 rjava-classfile = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

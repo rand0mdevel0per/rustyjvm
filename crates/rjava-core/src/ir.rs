@@ -6,6 +6,7 @@
 use portable_atomic::AtomicU32;
 use smallvec::SmallVec;
 
+use crate::diff::EscapeState;
 use crate::ids::{BlockId, ClassId, SlotId};
 use crate::value::{Tag, Val128};
 
@@ -33,6 +34,17 @@ pub enum Effect {
     MayThrow { caught: bool },
 }
 
+/// Integer comparison against zero — the condition of a JVM `if<cond>` branch (JVMS §6.5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntCond {
+    Eq,
+    Ne,
+    Lt,
+    Ge,
+    Gt,
+    Le,
+}
+
 /// SSA operation kind. Typed by [`Node::ty`], so a single arithmetic variant serves int/long/float
 /// (§9.2 — "ty is the static type fixed by verification"). Extended per increment; this is the
 /// increment-1 arithmetic / convert / compare core.
@@ -54,6 +66,49 @@ pub enum Op {
     Cmp {
         nan_greater: bool,
     },
+    /// `(input <cond> 0) ? 1 : 0`, as int. Produced for `if<cond>` so a nonzero-testing
+    /// [`Terminator::CondBranch`] can express the JVM branch condition.
+    TestZero(IntCond),
+    /// `(reference is null) == expect_null ? 1 : 0`, as int. Produced for `ifnull`/`ifnonnull`.
+    TestNull {
+        expect_null: bool,
+    },
+    /// `(a <cond> b) ? 1 : 0`, as int (two operands). Produced for `if_icmp<cond>`.
+    ICmp(IntCond),
+    /// Bitwise AND (typed by [`Node::ty`]: int or long). Other bitwise/shift ops are added on
+    /// demand in later increments.
+    And,
+    // ---- symbolic references (§8.3) ----
+    // These carry a *constant-pool index*, not a resolved target: class identity, field layout and
+    // dispatch are runtime-determined and must not be baked at build time (P-3, §8.3, §13.4). The
+    // interpreter resolves them through the class registry at first use.
+    /// `invokestatic`. `ins` are the arguments in order; `ty` is the return type (unused for `void`).
+    InvokeStatic(u16),
+    /// `invokespecial` — a constructor or other non-virtual instance call. `ins` is `[this, args…]`.
+    InvokeSpecial(u16),
+    /// `invokevirtual` — dispatched on the *runtime* class of `ins[0]` through the mutable dispatch
+    /// table (§13.4), never on the statically named class.
+    InvokeVirtual(u16),
+    /// Allocate an instance of the class named by the constant-pool entry. `escape` is the
+    /// escape-analysis classification (§9.4); `ins` is empty — allocation has no prerequisite
+    /// dependencies (§22.1).
+    New {
+        class_cp: u16,
+        escape: EscapeState,
+    },
+    /// Read the instance field named by the constant-pool entry from `ins[0]`; `ty` is its type.
+    GetField(u16),
+    /// Write `ins[1]` into the instance field named by the constant-pool entry of `ins[0]`.
+    PutField(u16),
+    /// Read a static field; triggers initialisation of its declaring class (§8.5).
+    GetStatic(u16),
+    /// Write `ins[0]` to a static field; triggers initialisation of its declaring class (§8.5).
+    PutStatic(u16),
+    /// `instanceof`: 1 if `ins[0]` is a non-null instance of the named class, else 0.
+    InstanceOf(u16),
+    /// `checkcast`: passes `ins[0]` through, raising `ClassCastException` if it is not an instance
+    /// of the named class (increment 8 turns that into a real Java exception).
+    CheckCast(u16),
 }
 
 /// An SSA node: a single value definition (§9.2).
