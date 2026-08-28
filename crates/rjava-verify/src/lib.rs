@@ -610,6 +610,11 @@ fn apply(
             }
         }
         0xc6 | 0xc7 => f.pop_expect(VType::Reference, pc)?, // ifnull / ifnonnull
+        0xa5 | 0xa6 => {
+            // if_acmpeq / if_acmpne: reference identity comparison
+            f.pop_expect(VType::Reference, pc)?;
+            f.pop_expect(VType::Reference, pc)?;
+        }
         0xb1 => {
             // return (void)
             if ret.is_some() {

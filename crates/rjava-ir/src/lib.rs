@@ -367,8 +367,22 @@ impl Ssa {
                 }
                 0x10..=0x11 => self.konst(nodes, &mut stack, Val128::from_i32(ins.arg as i32))?,
                 0x12..=0x14 => {
-                    let v = cp_const(cp, ins.arg, pc)?;
-                    self.konst(nodes, &mut stack, v)?;
+                    // `ldc` of a String constant materialises an interned String rather than a
+                    // primitive; the reference is resolved at run time (§8.3, §18.4).
+                    let idx = u16::try_from(ins.arg).map_err(|_| IrError::BadConstant(pc))?;
+                    if matches!(cp.get(idx), Some(Constant::String { .. })) {
+                        self.emit(
+                            nodes,
+                            &mut stack,
+                            Op::LoadString(idx),
+                            smallvec![],
+                            Tag::Ptr,
+                            Effect::ReadHeap,
+                        )?;
+                    } else {
+                        let v = cp_const(cp, ins.arg, pc)?;
+                        self.konst(nodes, &mut stack, v)?;
+                    }
                 }
                 // loads (read_variable)
                 0x15..=0x17 => {
@@ -516,6 +530,22 @@ impl Ssa {
                 0xac | 0xad | 0xb0 => {
                     let v = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
                     term = Some(Terminator::Return(Some(v)));
+                }
+                0xa5 | 0xa6 => {
+                    // if_acmpeq / if_acmpne: compare object identity, then branch on the result.
+                    let b = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let a = stack.pop().ok_or(IrError::StackUnderflow(pc))?;
+                    let cond = self.fresh()?;
+                    nodes.push(Node {
+                        id: cond,
+                        op: Op::RefEq {
+                            expect_same: ins.op == 0xa5,
+                        },
+                        ins: smallvec![a, b],
+                        ty: Tag::I32,
+                        effect: Effect::Pure,
+                    });
+                    term = Some(cond_branch(cond, ins, block_of, pc)?);
                 }
                 0xc6 | 0xc7 => {
                     // ifnull / ifnonnull: test the reference, then branch on the int result.

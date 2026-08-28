@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rjava_classfile::ClassFile;
-use rjava_core::{ClassId, Val128};
+use rjava_core::{BuiltinClass, ClassId, NativeFn, Val128};
 use rjava_ir::BuiltMethod;
 
 /// Failures while loading or linking a class.
@@ -50,6 +50,32 @@ pub enum InitState {
     Failed,
 }
 
+/// A method's implementation. `rustystd` supplies `java.*` in Rust (§18), so a builtin class's
+/// methods have no bytecode; guest classes have no natives. Both resolve and dispatch identically.
+pub enum MethodBody {
+    /// Verified, SSA-built bytecode.
+    Bytecode(BuiltMethod),
+    /// A `rustystd` implementation, injected as a function pointer (§16.1, §3.2).
+    Native(NativeFn),
+    /// Present in the class but not executable here (unverifiable, or abstract).
+    Absent,
+}
+
+impl MethodBody {
+    pub fn bytecode(&self) -> Option<&BuiltMethod> {
+        match self {
+            MethodBody::Bytecode(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub fn native(&self) -> Option<NativeFn> {
+        match self {
+            MethodBody::Native(f) => Some(*f),
+            _ => None,
+        }
+    }
+}
+
 /// One virtual-dispatch table entry: the class that defines the most-derived override, and the
 /// index of the method within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +87,13 @@ pub struct VEntry {
 /// A loaded, linked class.
 pub struct LoadedClass {
     pub name: String,
-    pub cf: ClassFile,
+    /// `None` for a builtin class: `rustystd` classes have no class file to parse (§17, §18).
+    pub cf: Option<ClassFile>,
     pub super_id: Option<ClassId>,
-    /// Verified + built methods, indexed as in the class file (`None` if it could not be built).
-    pub methods: Vec<Option<BuiltMethod>>,
+    /// Method implementations, indexed as in the class file (or as declared, for a builtin).
+    pub methods: Vec<MethodBody>,
+    /// `(name, descriptor)` of a declared method → its index in `methods`.
+    method_index: HashMap<(String, String), u16>,
     /// Where this class's own instance fields begin; everything below is inherited (§8).
     pub field_base: u16,
     /// Type-appropriate zero values for a whole instance, inherited fields first.
@@ -104,14 +133,15 @@ impl LoadedClass {
 
     /// The index of a method declared directly by this class.
     pub fn method_index(&self, name: &str, desc: &str) -> Option<u16> {
-        self.cf
-            .methods
-            .iter()
-            .position(|m| {
-                m.name(&self.cf.constant_pool) == Some(name)
-                    && m.descriptor(&self.cf.constant_pool) == Some(desc)
-            })
-            .map(|i| i as u16)
+        self.method_index
+            .get(&(name.to_string(), desc.to_string()))
+            .copied()
+    }
+
+    /// This class's constant pool, for resolving the symbolic references in its bytecode. A builtin
+    /// has none — its methods are native and reference nothing symbolically.
+    pub fn constant_pool(&self) -> Option<&rjava_classfile::ConstantPool> {
+        self.cf.as_ref().map(|c| &c.constant_pool)
     }
 
     pub fn init_state(&self) -> InitState {
@@ -274,20 +304,32 @@ impl ClassRegistry {
             }
         }
 
-        let methods = cf
+        let mut method_index = HashMap::new();
+        let methods: Vec<MethodBody> = cf
             .methods
             .iter()
-            .map(|m| {
-                rjava_verify::verify_method(&cf, m)
+            .enumerate()
+            .map(|(i, m)| {
+                if let (Some(n), Some(d)) =
+                    (m.name(&cf.constant_pool), m.descriptor(&cf.constant_pool))
+                {
+                    method_index.insert((n.to_string(), d.to_string()), i as u16);
+                }
+                match rjava_verify::verify_method(&cf, m)
                     .ok()
                     .and_then(|vm| rjava_ir::build(&vm, &cf).ok())
+                {
+                    Some(b) => MethodBody::Bytecode(b),
+                    None => MethodBody::Absent,
+                }
             })
             .collect();
 
         self.by_name.insert(name.clone(), id);
         self.classes.push(LoadedClass {
             name,
-            cf,
+            cf: Some(cf),
+            method_index,
             super_id,
             methods,
             field_base,
@@ -298,6 +340,82 @@ impl ClassRegistry {
             vtable,
             vindex,
             init: Cell::new(InitState::Loaded),
+        });
+        id
+    }
+
+    /// Register a class supplied by `rustystd` (§18): no class file, native method bodies, and
+    /// otherwise indistinguishable to resolution and dispatch from a loaded class. Its superclass
+    /// must already be registered.
+    pub fn register_builtin(&mut self, b: BuiltinClass) -> ClassId {
+        let super_id = b.super_name.and_then(|s| self.by_name.get(s)).copied();
+        let (mut field_defaults, mut field_index, mut vtable, mut vindex) = match super_id {
+            Some(sid) => {
+                let sup = &self.classes[sid.0 as usize];
+                (
+                    sup.field_defaults.clone(),
+                    sup.field_index.clone(),
+                    sup.vtable.clone(),
+                    sup.vindex.clone(),
+                )
+            }
+            None => (Vec::new(), HashMap::new(), Vec::new(), HashMap::new()),
+        };
+        let field_base = field_defaults.len() as u16;
+        let id = ClassId(self.classes.len() as u32);
+
+        for (fname, fdesc) in b.fields {
+            field_index.insert(
+                (fname.to_string(), fdesc.to_string()),
+                field_defaults.len() as u16,
+            );
+            field_defaults.push(field_default(fdesc));
+        }
+        let mut statics = Vec::new();
+        let mut static_index = HashMap::new();
+        for (sname, sdesc) in b.statics {
+            static_index.insert((sname.to_string(), sdesc.to_string()), statics.len());
+            statics.push(field_default(sdesc));
+        }
+
+        let mut method_index = HashMap::new();
+        let mut methods = Vec::new();
+        for (i, m) in b.methods.iter().enumerate() {
+            let key = (m.name.to_string(), m.descriptor.to_string());
+            method_index.insert(key.clone(), i as u16);
+            methods.push(MethodBody::Native(m.body));
+            if m.is_static || m.name == "<init>" || m.name == "<clinit>" {
+                continue;
+            }
+            let entry = VEntry {
+                class: id,
+                method: i as u16,
+            };
+            match vindex.get(&key) {
+                Some(&slot) => vtable[slot] = entry,
+                None => {
+                    vindex.insert(key, vtable.len());
+                    vtable.push(entry);
+                }
+            }
+        }
+
+        self.by_name.insert(b.name.to_string(), id);
+        self.classes.push(LoadedClass {
+            name: b.name.to_string(),
+            cf: None,
+            super_id,
+            methods,
+            method_index,
+            field_base,
+            field_defaults,
+            field_index,
+            statics: RefCell::new(statics),
+            static_index,
+            vtable,
+            vindex,
+            // A builtin has no `<clinit>` bytecode; it is ready the moment it is registered.
+            init: Cell::new(InitState::Initialized),
         });
         id
     }
@@ -358,8 +476,7 @@ pub enum Resolved {
 
 impl ClassRegistry {
     fn cp_names(&self, from: ClassId, cpidx: u16) -> Option<(String, String, String)> {
-        let cf = &self.get(from)?.cf;
-        let cp = &cf.constant_pool;
+        let cp = self.get(from)?.constant_pool()?;
         let (class_index, nat) = match cp.get(cpidx)? {
             rjava_classfile::Constant::MethodRef {
                 class_index,
@@ -388,7 +505,7 @@ impl ClassRegistry {
 
     /// The class a `Class` constant names (`new`, `instanceof`, `checkcast`).
     pub fn resolve_class(&self, from: ClassId, cpidx: u16) -> Option<ClassId> {
-        let name = self.get(from)?.cf.constant_pool.class_name(cpidx)?;
+        let name = self.get(from)?.constant_pool()?.class_name(cpidx)?;
         self.by_name(name)
     }
 

@@ -73,6 +73,12 @@ pub enum Op {
     TestNull {
         expect_null: bool,
     },
+    /// `(a is the same object as b) == expect_same ? 1 : 0`, as int. Produced for
+    /// `if_acmpeq`/`if_acmpne`: reference **identity**, which is what makes string interning
+    /// observable (§18.4).
+    RefEq {
+        expect_same: bool,
+    },
     /// `(a <cond> b) ? 1 : 0`, as int (two operands). Produced for `if_icmp<cond>`.
     ICmp(IntCond),
     /// Bitwise AND (typed by [`Node::ty`]: int or long). Other bitwise/shift ops are added on
@@ -100,6 +106,9 @@ pub enum Op {
     GetField(u16),
     /// Write `ins[1]` into the instance field named by the constant-pool entry of `ins[0]`.
     PutField(u16),
+    /// Materialise the interned `java.lang.String` for a `String` constant (`ldc`). Interning is
+    /// observable: two `ldc` of the same literal yield the *same* reference (§18.4).
+    LoadString(u16),
     /// Read a static field; triggers initialisation of its declaring class (§8.5).
     GetStatic(u16),
     /// Write `ins[0]` to a static field; triggers initialisation of its declaring class (§8.5).

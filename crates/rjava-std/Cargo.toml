@@ -8,4 +8,3 @@ repository.workspace = true
 
 [dependencies]
 rjava-core = { workspace = true }
-rjava-interp = { workspace = true }

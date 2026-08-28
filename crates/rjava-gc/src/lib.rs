@@ -23,6 +23,10 @@ pub struct Object {
     ///
     /// Signed so that a stray decrement is caught by an assertion rather than wrapping.
     rc: i64,
+    /// Native payload for a builtin class whose representation is not a plain field vector — a
+    /// `java.lang.String`'s characters. A real JVM keeps them in a `byte[]` field; RustyJVM will
+    /// too once array objects exist, at which point this becomes a general native-payload slot.
+    text: Option<Box<str>>,
 }
 
 /// The object heap: an indirection table from [`RefIndex`] to object storage (§4.3). A free list
@@ -71,6 +75,7 @@ impl Heap {
             // A fresh object is named by nothing yet; the write that stores it into a slot or field
             // is what raises the count (§5.5 — deltas land in program order, never eagerly).
             rc: 0,
+            text: None,
         };
         let idx = if let Some(i) = self.free.pop() {
             self.slots[i as usize] = Some(obj);
@@ -182,6 +187,22 @@ impl Heap {
     /// Number of currently-live objects.
     pub fn live(&self) -> usize {
         self.live
+    }
+
+    /// Attach a builtin's native text payload (a `String`'s characters).
+    pub fn set_text(&mut self, r: RefIndex, text: &str) -> bool {
+        match self.slots.get_mut(r.0 as usize).and_then(Option::as_mut) {
+            Some(o) => {
+                o.text = Some(text.into());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A builtin's native text payload, if it has one.
+    pub fn text(&self, r: RefIndex) -> Option<&str> {
+        self.get(r).and_then(|o| o.text.as_deref())
     }
 
     /// This object's escape state, if it is live.

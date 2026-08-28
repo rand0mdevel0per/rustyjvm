@@ -13,5 +13,9 @@ rjava-verify = { workspace = true }
 rjava-ir = { workspace = true }
 rjava-gc = { workspace = true }
 rjava-loader = { workspace = true }
+# The builtin classes are injected as data and their reentry needs are served by the `NativeEnv`
+# trait in rjava-core, so rjava-std has no edge back here and the DAG stays acyclic. This inverts
+# the direction sketched in RJVM-SPEC-001 §3.2, which assumed reentry needed a crate dependency.
+rjava-std = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
