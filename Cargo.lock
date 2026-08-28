@@ -279,6 +279,7 @@ dependencies = [
  "rjava-gc",
  "rjava-ir",
  "rjava-loader",
+ "rjava-std",
  "rjava-verify",
  "smallvec",
  "thiserror",
@@ -328,7 +329,6 @@ name = "rjava-std"
 version = "0.0.0"
 dependencies = [
  "rjava-core",
- "rjava-interp",
 ]
 
 [[package]]

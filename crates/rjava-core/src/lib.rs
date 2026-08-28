@@ -15,6 +15,7 @@ pub mod env;
 pub mod ids;
 pub mod ir;
 pub mod lock;
+pub mod native;
 pub mod registry;
 pub mod value;
 
@@ -26,5 +27,6 @@ pub use ir::{
     ACCEL_BLOB_BASE, ACCEL_INTERPRET, ACCEL_JIT_PENDING,
 };
 pub use lock::{Monitor, U16Lock, U32Lock};
+pub use native::{BuiltinClass, BuiltinMethod, NativeEnv, NativeError, NativeFn};
 pub use registry::{ControlBlock, RefCounts, RegistryVec};
 pub use value::{Tag, Val128, PAYLOAD_BITS};

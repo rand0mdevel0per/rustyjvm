@@ -22,7 +22,7 @@ impl Insn {
     /// The absolute branch target, for `if<cond>`/`if_icmp<cond>`/`ifnull`/`ifnonnull`/`goto`.
     pub fn branch_target(&self) -> Option<u32> {
         match self.op {
-            0x99..=0xa4 | 0xa7 | 0xc6 | 0xc7 => Some(self.arg as u32),
+            0x99..=0xa7 | 0xc6 | 0xc7 => Some(self.arg as u32),
             _ => None,
         }
     }
@@ -93,7 +93,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Insn>, VerifyError> {
             0x13 | 0x14 => (u2_at(code, pc + 1)?, 3), // ldc_w / ldc2_w
             // invoke* / new / field access / instanceof / checkcast (cp index)
             0xb2..=0xb8 | 0xbb | 0xc0 | 0xc1 => (u2_at(code, pc + 1)?, 3),
-            0x99..=0xa4 | 0xa7 | 0xc6 | 0xc7 => (pc as i64 + s2_at(code, pc + 1)?, 3), // branches
+            0x99..=0xa7 | 0xc6 | 0xc7 => (pc as i64 + s2_at(code, pc + 1)?, 3), // branches
             _ => return Err(VerifyError::UnsupportedOpcode { op, pc: pc as u32 }),
         };
         out.push(Insn {

@@ -15,7 +15,7 @@ use rjava_core::{
 };
 use rjava_gc::Heap;
 use rjava_ir::BuiltMethod;
-use rjava_loader::{ClassRegistry, InitState, Resolved};
+use rjava_loader::{ClassRegistry, InitState, MethodBody, Resolved};
 
 /// A runtime failure. Increment 1 cannot yet raise Java exceptions (those arrive in increment 8);
 /// conditions like division by zero surface as errors here for now.
@@ -51,6 +51,18 @@ pub enum ExecError {
     ClassInitFailed,
     #[error("bad cast (ClassCastException, implemented in increment 8)")]
     ClassCast,
+    #[error("a native method failed: {0:?}")]
+    Native(rjava_core::NativeError),
+}
+
+impl From<rjava_core::NativeError> for ExecError {
+    fn from(e: rjava_core::NativeError) -> Self {
+        match e {
+            rjava_core::NativeError::OutOfMemory => ExecError::OutOfMemory,
+            rjava_core::NativeError::NullPointer => ExecError::NullPointer,
+            rjava_core::NativeError::BadValue => ExecError::BadValue,
+        }
+    }
 }
 
 /// Default guest call-stack limit, in frames.
@@ -77,17 +89,78 @@ pub struct Program {
     entry: ClassId,
     /// Guest call-stack limit (see [`DEFAULT_MAX_CALL_DEPTH`]).
     max_call_depth: usize,
+    /// The interned string pool. Interning is observable — two `ldc` of the same literal must yield
+    /// the same reference (§18.4) — and interned strings are GC roots (§6.3), so entries here are
+    /// never released.
+    interned: std::cell::RefCell<std::collections::HashMap<String, Val128>>,
+    /// Where guest output goes. `None` writes through to the process's standard output, which is
+    /// what a launcher wants; `Some(buf)` captures it so a differential test can compare the bytes
+    /// against Corretto's.
+    captured: std::cell::RefCell<Option<Vec<u8>>>,
+    /// The object heap. It belongs to the VM, not to a call: interned strings and `System.out` are
+    /// references *into* it that outlive any single invocation, so a per-call heap would leave them
+    /// dangling the moment a second method ran.
+    heap: std::cell::RefCell<Heap>,
 }
 
 impl Program {
     /// Build a single-class program (the increment 1–5 entry point).
     pub fn from_class(cf: &rjava_classfile::ClassFile) -> Program {
         let mut registry = ClassRegistry::new();
+        install_builtins(&mut registry);
         let entry = registry.link_class(cf.clone());
+        Program::with_registry(registry, entry)
+    }
+
+    fn with_registry(registry: ClassRegistry, entry: ClassId) -> Program {
         Program {
-            entry,
             registry,
+            entry,
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
+            interned: std::cell::RefCell::new(std::collections::HashMap::new()),
+            captured: std::cell::RefCell::new(None),
+            heap: std::cell::RefCell::new(Heap::new()),
+        }
+    }
+
+    /// Cap the number of simultaneously-live objects, so a test can prove that reclamation actually
+    /// happens rather than merely not overflowing (§22.1).
+    pub fn with_heap_limit(self, objects: usize) -> Self {
+        *self.heap.borrow_mut() = Heap::with_limit(objects);
+        self
+    }
+
+    /// Number of live objects on this VM's heap.
+    pub fn heap_live(&self) -> usize {
+        self.heap.borrow().live()
+    }
+
+    /// Capture guest output instead of writing it through to standard output.
+    pub fn capturing(self) -> Self {
+        *self.captured.borrow_mut() = Some(Vec::new());
+        self
+    }
+
+    /// Take everything the guest has printed since the last call (capturing programs only).
+    pub fn take_output(&self) -> Vec<u8> {
+        self.captured
+            .borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Write guest output to wherever this program directs it.
+    fn write_output(&self, s: &str) {
+        let mut sink = self.captured.borrow_mut();
+        match sink.as_mut() {
+            Some(buf) => buf.extend_from_slice(s.as_bytes()),
+            None => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(s.as_bytes());
+                let _ = out.flush();
+            }
         }
     }
 
@@ -98,15 +171,12 @@ impl Program {
         entry_class: &str,
     ) -> Result<Program, rjava_loader::LoaderError> {
         let mut registry = ClassRegistry::new();
+        install_builtins(&mut registry);
         registry.load_dir(dir)?;
         let entry = registry
             .by_name(entry_class)
             .ok_or_else(|| rjava_loader::LoaderError::NotFound(entry_class.to_string()))?;
-        Ok(Program {
-            registry,
-            entry,
-            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
-        })
+        Ok(Program::with_registry(registry, entry))
     }
 
     pub fn registry(&self) -> &ClassRegistry {
@@ -129,21 +199,44 @@ impl Program {
         depth: usize,
         heap: &mut Heap,
     ) -> Result<Option<Val128>, ExecError> {
-        let built = self
+        let body = self
             .registry
             .get(class)
             .and_then(|k| k.methods.get(index as usize))
-            .and_then(Option::as_ref)
             .ok_or(ExecError::NoMethod)?;
-        run(
-            self,
-            class,
-            built,
-            args,
-            depth,
-            LogicalFrame(index as u32),
-            heap,
-        )
+        match body {
+            MethodBody::Bytecode(built) => run(
+                self,
+                class,
+                built,
+                args,
+                depth,
+                LogicalFrame(index as u32),
+                heap,
+            ),
+            // A `rustystd` method is an `Effect::Extern` boundary, so it runs directly (§10.6,
+            // §16.1) rather than through the diff machinery.
+            MethodBody::Native(f) => {
+                let r = {
+                    let mut ctx = Ctx {
+                        program: self,
+                        heap,
+                    };
+                    f(&mut ctx, args)?
+                };
+                // A native method hands its result over the same way a bytecode frame does: with an
+                // in-transit reference the caller drops once one of its slots owns it (§5.5).
+                // Without it the caller's acquire/release pair nets to zero and a freshly created
+                // String is reclaimed the instant it is stored.
+                if let Some(v) = r {
+                    if v.tag().is_ref() {
+                        heap.add_rc(v.ref_index(), 1);
+                    }
+                }
+                Ok(r)
+            }
+            MethodBody::Absent => Err(ExecError::NoMethod),
+        }
     }
 
     /// The entry class's index for a method, by name and descriptor.
@@ -159,8 +252,76 @@ impl Program {
         args: &[Val128],
     ) -> Result<Option<Val128>, ExecError> {
         let idx = self.method_index(name, desc).ok_or(ExecError::NoMethod)?;
-        let mut heap = Heap::new();
+        let mut heap = self.heap.borrow_mut();
+        self.init_system_streams(&mut heap)?;
         self.call(self.entry, idx, args, 0, &mut heap)
+    }
+
+    /// Allocate a `java.lang.String` holding `text`.
+    fn alloc_string(&self, heap: &mut Heap, text: &str) -> Result<Val128, ExecError> {
+        let cls = self
+            .registry
+            .by_name("java/lang/String")
+            .ok_or(ExecError::Unresolved)?;
+        let defaults = self
+            .registry
+            .get(cls)
+            .ok_or(ExecError::Unresolved)?
+            .field_defaults
+            .clone();
+        // A String is shared the moment it exists (it is handed to callers and interned), so it is
+        // reference counted rather than scope-exclusive (§5.2).
+        let r = heap
+            .alloc(cls, EscapeState::S2, defaults)
+            .ok_or(ExecError::OutOfMemory)?;
+        heap.set_text(r, text);
+        Ok(Val128::ptr(r))
+    }
+
+    /// The interned `String` for a literal: the same literal always yields the same reference
+    /// (§18.4). Interned strings are roots, so their count is pinned above zero.
+    fn intern(&self, heap: &mut Heap, text: &str) -> Result<Val128, ExecError> {
+        if let Some(&v) = self.interned.borrow().get(text) {
+            return Ok(v);
+        }
+        let v = self.alloc_string(heap, text)?;
+        // Pin it: the pool holds a permanent reference, so it is never reclaimed.
+        heap.add_rc(v.ref_index(), 1);
+        self.interned.borrow_mut().insert(text.to_string(), v);
+        Ok(v)
+    }
+
+    /// Create the `PrintStream` singletons and store them in `System.out` / `System.err`.
+    fn init_system_streams(&self, heap: &mut Heap) -> Result<(), ExecError> {
+        let sys = self
+            .registry
+            .by_name("java/lang/System")
+            .ok_or(ExecError::Unresolved)?;
+        let k = self.registry.get(sys).ok_or(ExecError::Unresolved)?;
+        let ps = self
+            .registry
+            .by_name("java/io/PrintStream")
+            .ok_or(ExecError::Unresolved)?;
+        for field in ["out", "err"] {
+            let Some(slot) = k.static_slot(field, "Ljava/io/PrintStream;") else {
+                continue;
+            };
+            if k.statics.borrow()[slot].tag().is_ref() {
+                continue; // already installed
+            }
+            let defaults = self
+                .registry
+                .get(ps)
+                .ok_or(ExecError::Unresolved)?
+                .field_defaults
+                .clone();
+            let r = heap
+                .alloc(ps, EscapeState::S2, defaults)
+                .ok_or(ExecError::OutOfMemory)?;
+            heap.add_rc(r, 1); // a static field is a root-held reference
+            k.statics.borrow_mut()[slot] = Val128::ptr(r);
+        }
+        Ok(())
     }
 
     /// Run `<clinit>` if this class has not been initialised yet (§8.5, JVMS §5.5).
@@ -194,6 +355,84 @@ impl Program {
         }
         k.set_init_state(InitState::Initialized);
         Ok(())
+    }
+}
+
+/// Register `rustystd`'s builtin classes and wire up `System.out` (§18, §17).
+///
+/// The builtins are handed over as data, so the interpreter never links against `rjava-std` — the
+/// dependency direction of §3.2 stays intact.
+fn install_builtins(registry: &mut ClassRegistry) {
+    for b in rjava_std::builtins() {
+        registry.register_builtin(b);
+    }
+}
+
+/// The [`NativeEnv`] a native method sees: the program (for class lookup and interning) and the
+/// heap. Deliberately narrow — a native method cannot reach the registry or the diff machinery.
+struct Ctx<'a> {
+    program: &'a Program,
+    heap: &'a mut Heap,
+}
+
+impl rjava_core::NativeEnv for Ctx<'_> {
+    fn new_string(&mut self, s: &str) -> Result<Val128, rjava_core::NativeError> {
+        self.program
+            .alloc_string(self.heap, s)
+            .map_err(|_| rjava_core::NativeError::OutOfMemory)
+    }
+
+    fn string_text(&self, v: Val128) -> Option<String> {
+        if !v.tag().is_ref() {
+            return None;
+        }
+        let obj = self.heap.get(v.ref_index())?;
+        // Only a real String carries text, so this cannot be spoofed by another class.
+        if self
+            .program
+            .registry
+            .get(obj.class)
+            .map(|k| k.name.as_str())
+            != Some("java/lang/String")
+        {
+            return None;
+        }
+        self.heap.text(v.ref_index()).map(str::to_string)
+    }
+
+    fn print(&mut self, s: &str) {
+        // Printing is `Effect::Extern`: it lands in program order and is never speculated (§10.6).
+        self.program.write_output(s);
+    }
+
+    fn get_field(&self, obj: Val128, slot: u16) -> Result<Val128, rjava_core::NativeError> {
+        if obj.tag() == Tag::Null {
+            return Err(rjava_core::NativeError::NullPointer);
+        }
+        self.heap
+            .get_field(obj.ref_index(), slot as usize)
+            .ok_or(rjava_core::NativeError::BadValue)
+    }
+
+    fn set_field(
+        &mut self,
+        obj: Val128,
+        slot: u16,
+        v: Val128,
+    ) -> Result<(), rjava_core::NativeError> {
+        if obj.tag() == Tag::Null {
+            return Err(rjava_core::NativeError::NullPointer);
+        }
+        if self.heap.set_field(obj.ref_index(), slot as usize, v) {
+            Ok(())
+        } else {
+            Err(rjava_core::NativeError::BadValue)
+        }
+    }
+
+    fn class_name_of(&self, v: Val128) -> Option<String> {
+        let obj = self.heap.get(v.ref_index())?;
+        self.program.registry.get(obj.class).map(|k| k.name.clone())
     }
 }
 
@@ -474,6 +713,22 @@ fn run_body(
                         env.record_ref_delta(old.ref_index(), -1);
                     }
                 }
+                Op::LoadString(cp) => {
+                    let text = program
+                        .registry
+                        .get(owner)
+                        .and_then(|k| k.constant_pool())
+                        .and_then(|cp_pool| match cp_pool.get(cp) {
+                            Some(rjava_classfile::Constant::String { string_index }) => {
+                                cp_pool.utf8(*string_index)
+                            }
+                            _ => None,
+                        })
+                        .ok_or(ExecError::Unresolved)?
+                        .to_string();
+                    let v = program.intern(heap, &text)?;
+                    env.write_slot(SlotId(node.id.offset), v);
+                }
                 Op::GetStatic(cp) | Op::PutStatic(cp) => {
                     let Resolved::StaticField { class, slot } = program
                         .registry
@@ -608,6 +863,18 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
             let is_null = ins.first().ok_or(ExecError::BadValue)?.tag() == Tag::Null;
             Val128::from_i32((is_null == expect_null) as i32)
         }
+        Op::RefEq { expect_same } => {
+            let a = *ins.first().ok_or(ExecError::BadValue)?;
+            let b = *ins.get(1).ok_or(ExecError::BadValue)?;
+            // Identity, not equality: two references name the same object iff they name the same
+            // registry entry, and `null == null` holds.
+            let same = match (a.tag(), b.tag()) {
+                (Tag::Null, Tag::Null) => true,
+                (x, y) if x.is_ref() && y.is_ref() => a.ref_index() == b.ref_index(),
+                _ => false,
+            };
+            Val128::from_i32((same == expect_same) as i32)
+        }
         Op::ICmp(cond) => {
             let a = ins.first().ok_or(ExecError::BadValue)?.as_i32();
             let b = ins.get(1).ok_or(ExecError::BadValue)?.as_i32();
@@ -640,7 +907,8 @@ fn eval(op: Op, ty: Tag, ins: &[Val128]) -> Result<Val128, ExecError> {
         | Op::GetStatic(_)
         | Op::PutStatic(_)
         | Op::InstanceOf(_)
-        | Op::CheckCast(_) => return Err(ExecError::UnsupportedOp),
+        | Op::CheckCast(_)
+        | Op::LoadString(_) => return Err(ExecError::UnsupportedOp),
     })
 }
 
@@ -2121,5 +2389,79 @@ public final class ShapesOracle {
             );
         }
         eprintln!("abrupt-exit teardown OK: 5 failed calls on a 2-object heap, nothing retained");
+    }
+
+    /// Increment-7 conformance gate: `rustystd`'s builtin classes. Every effect here is **standard
+    /// output**, so the test compares RustyJVM's bytes against Corretto's byte for byte — literal
+    /// interning identity, `String` methods (including the JLS `hashCode` polynomial), and
+    /// `System.out` formatting all have to agree.
+    #[test]
+    fn differential_stdout_vs_corretto_21() {
+        if !tool_ok("javac") || !tool_ok("java") {
+            eprintln!("skipping differential_stdout: JDK unavailable");
+            return;
+        }
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/java/Hello.java");
+        let dir = std::env::temp_dir().join(format!("rjava-hello-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The oracle calls the same methods in the same order, on one JVM, so interning and any
+        // other cross-call state is exercised identically.
+        let oracle = r#"
+public final class HelloOracle {
+    public static void main(String[] a) {
+        Hello.greet();
+        Hello.strings();
+        Hello.interning();
+        Hello.primitives();
+        Hello.unicode();
+    }
+}
+"#;
+        std::fs::write(dir.join("HelloOracle.java"), oracle).unwrap();
+        if !std::process::Command::new("javac")
+            .args(["--release", "21", "-d"])
+            .arg(&dir)
+            .arg(&src)
+            .arg(dir.join("HelloOracle.java"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping differential_stdout: javac cannot target --release 21");
+            return;
+        }
+        let out = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("HelloOracle")
+            .output()
+            .expect("oracle runs");
+        assert!(
+            out.status.success(),
+            "oracle failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Corretto writes '\n'; normalise so the comparison is about content, not line endings.
+        let expected = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+
+        let program = Program::from_classpath(&dir, "Hello")
+            .expect("classpath links")
+            .capturing();
+        for m in ["greet", "strings", "interning", "primitives", "unicode"] {
+            program
+                .call_named(m, "()V", &[])
+                .unwrap_or_else(|e| panic!("Hello.{m}() failed: {e:?}"));
+        }
+        let got = String::from_utf8(program.take_output()).expect("guest output is UTF-8");
+
+        assert_eq!(
+            got, expected,
+            "stdout diverged from Corretto 21\n--- rustyjvm ---\n{got}\n--- corretto ---\n{expected}"
+        );
+        eprintln!(
+            "stdout differential OK: {} bytes match Corretto 21",
+            got.len()
+        );
     }
 }
